@@ -1,0 +1,92 @@
+run_name: sdegan_ou
+seed: 0
+device: auto
+
+paths:
+  log_root: ${hydra:runtime.cwd}/logs
+
+data:
+  dataset_size: 8192
+  t_size: 64
+  dt: 1.0
+  normalize: true
+  shuffle: true
+  drop_last: true
+  num_workers: 0
+
+simulator:
+  name: ou
+  gbm:
+    dim: 1
+    s0: 1.0
+    mu: 0.05
+    sigma: 0.2
+    rho: 0.0
+    corr: null
+  ou:
+    s0: 1.0
+    theta: 0.1
+    mu: 0.02
+    sigma: 0.4
+  deterministic:
+    s0: 0.0
+    mu: 0.1
+
+model:
+  generator:
+    noise_size: 1
+    noise_type: diagonal
+    drift_head: simple
+    diffusion_head: simple
+    drift_window_size: 1
+    diffusion_window_size: 1
+    hidden_size: 32
+    num_layers: 2
+    drift_init: 0.0
+    diffusion_init: 0.1
+    drift_scale: 1.0
+    diffusion_scale: 1.0
+    final_tanh: true
+    method: reversible_heun
+    dt: null
+  discriminator:
+    hidden_size: 16
+    mlp_size: 16
+    num_layers: 1
+    method: reversible_heun
+    dt: 1.0
+    adjoint: true
+
+train:
+  epochs: 100
+  steps: null
+  steps_per_epoch: null
+  batch_size: 1024
+  generator_lr: 2.0e-4
+  discriminator_lr: 1.0e-3
+  weight_decay: 1.0e-2
+  optimizer: adadelta
+  n_critic: 1
+  clip_discriminator: true
+  swa_start_step: 5000
+  log_every: 10
+  eval_every: 0
+  init_mult_initial: 1.0
+  init_mult_func: 1.0
+  save_checkpoint: true
+
+evaluation:
+  enabled: true
+  every_epoch: 1
+  n_paths: 512
+  num_quantiles: 1024
+  align_initial: true
+
+plots:
+  enabled: true
+  n_paths: 24
+  align_initial: true
+
+hydra:
+  run:
+    dir: ${paths.log_root}/hydra/${run_name}
