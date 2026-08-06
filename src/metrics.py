@@ -36,6 +36,8 @@ def expected_supremum_squared_error(real_paths, generated_paths) -> torch.Tensor
 
     Inputs have shape (N, T, D), or (N, T) for one-dimensional paths. For D > 1 the
     coordinate-wise squared error is summed before taking the supremum over time.
+    This is a strong/pathwise metric: real_paths[i] and generated_paths[i] should
+    be driven by the same Brownian path when the metric is used for SDE quality.
     """
 
     real, generated = _validate_pair(real_paths, generated_paths)

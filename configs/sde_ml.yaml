@@ -1,0 +1,106 @@
+run_name: sde_ml_ou_simple
+seed: 0
+device: auto
+
+paths:
+  log_root: ${hydra:runtime.cwd}/logs
+
+data:
+  dataset_size: 5000
+  t_size: 301
+  dt: 0.1
+  normalize: false
+  shuffle: true
+  drop_last: false
+  num_workers: 0
+
+simulator:
+  name: ou
+  abm:
+    dim: 1
+    s0: 0.0
+    mu: 0.1
+    sigma: 0.2
+    rho: 0.0
+    corr: null
+  gbm:
+    dim: 1
+    s0: 1.0
+    mu: 0.05
+    sigma: 0.2
+    rho: 0.0
+    corr: null
+  ou:
+    s0: 1.0
+    theta: 0.1
+    mu: 0.02
+    sigma: 0.4
+  deterministic:
+    s0: 0.0
+    mu: 0.1
+
+model:
+  noise_size: 1
+  noise_type: diagonal
+  sde_type: ito
+  drift_head: simple
+  diffusion_head: simple
+  drift_window_size: 1
+  diffusion_window_size: 1
+  hidden_size: 8
+  num_layers: 1
+  drift_init: 0.0
+  diffusion_init: 0.1
+  drift_scale: 1.0
+  diffusion_scale: 1.0
+  final_tanh: false
+  variance_floor: 1.0e-6
+  diffusion_min: 1.0e-4
+  initial_value: auto
+  learn_initial: false
+  time_origin: auto
+  time_scale: auto
+  state_center: 0.0
+  state_scale: auto
+  input_clip: 20.0
+  method: euler
+  dt:  0.1
+  adjoint: false
+  sampling_backend: torchsde
+
+train:
+  epochs: 100
+  steps: 1000
+  steps_per_epoch: 10
+  batch_size: 1024
+  lr: 1.0e-3
+  weight_decay: 0.0
+  optimizer: adam
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  grad_clip_norm: 20.0
+  log_every: 10
+  eval_every: 0
+  likelihood_backend: direct
+  sampling_backend: direct
+  include_initial_likelihood: false
+  initial_std: null
+  save_checkpoint: false
+
+evaluation:
+  enabled: true
+  every_epoch: 1
+  n_paths: 512
+  num_quantiles: 1024
+  align_initial: true
+  coupled_brownian: true
+  brownian_seed: 0
+
+plots:
+  enabled: true
+  n_paths: 24
+  align_initial: true
+
+hydra:
+  run:
+    dir: ${paths.log_root}/hydra/${run_name}

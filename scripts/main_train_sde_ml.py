@@ -10,20 +10,21 @@ import hydra
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 import torch
+from torch.utils.data import DataLoader, TensorDataset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.nets.sdegan import CDEDiscriminator, SDEGenerator
+from src.nets.sde_ml import SDEML
 from src.simulators import (
     ArithmeticBrownianMotionSimulator,
     DeterministicDriftSimulator,
     MultiDimensionalGBMSimulator,
     OUSimulator,
 )
-from src.train import SDEGANTrainConfig, train_sdegan
-from utils.data import PathDataConfig, make_sdegan_dataset
+from src.train import SDEMLTrainConfig, train_sde_ml
+from utils.data import PathDataConfig, normalize_paths_by_initial, validate_paths
 from utils.logging import log_config, setup_logger
 from utils.visual import (
     plot_constant_coefficient_history,
@@ -141,12 +142,77 @@ def true_constant_coefficients(simulator) -> dict[str, list[float]]:
     }
 
 
+def make_path_dataloader(
+    *,
+    simulator,
+    data_config: PathDataConfig,
+    batch_size: int,
+    num_workers: int,
+) -> tuple[torch.Tensor, torch.Tensor, DataLoader]:
+    ts, paths = simulator.simulate(
+        n_paths=data_config.dataset_size,
+        n_steps=data_config.t_size,
+        dt=data_config.dt,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    paths = validate_paths(paths)
+    if data_config.normalize:
+        paths = normalize_paths_by_initial(paths)
+
+    dataloader = DataLoader(
+        TensorDataset(paths),
+        batch_size=batch_size,
+        shuffle=data_config.shuffle,
+        drop_last=data_config.drop_last,
+        num_workers=num_workers,
+    )
+    return ts, paths, dataloader
+
+
+def resolve_initial_value(value, paths: torch.Tensor):
+    if isinstance(value, str) and value.lower() == "auto":
+        return paths[0, 0, :].detach().cpu().tolist()
+    return _as_float_or_list(value, dim=paths.size(-1), name="model.initial_value")
+
+
+def resolve_time_origin(value, ts: torch.Tensor) -> float:
+    if isinstance(value, str) and value.lower() == "auto":
+        return float(ts[0].detach().cpu().item())
+    return float(value)
+
+
+def resolve_time_scale(value, ts: torch.Tensor) -> float:
+    if isinstance(value, str) and value.lower() == "auto":
+        return max(float((ts[-1] - ts[0]).detach().cpu().item()), 1.0)
+    return float(value)
+
+
+def resolve_state_center(value, paths: torch.Tensor) -> float | list[float]:
+    if isinstance(value, str) and value.lower() == "auto":
+        return paths.flatten(0, 1).mean(dim=0).detach().cpu().tolist()
+    return _as_float_or_list(value, dim=paths.size(-1), name="model.state_center")
+
+
+def resolve_state_scale(value, paths: torch.Tensor) -> float | list[float]:
+    if isinstance(value, str) and value.lower() == "auto":
+        scale = paths.flatten(0, 1).abs().quantile(0.90, dim=0).clamp_min(1.0)
+        return scale.detach().cpu().tolist()
+    return _as_float_or_list(value, dim=paths.size(-1), name="model.state_scale")
+
+
+def resolve_optional_float(value):
+    if value is None:
+        return None
+    return float(value)
+
+
 def maybe_save_plots(
     *,
     cfg: DictConfig,
     fig_dir: Path,
     history: dict[str, list[float]],
-    generator: SDEGenerator,
+    model: SDEML,
     ts: torch.Tensor,
     real_paths: torch.Tensor,
     true_coefficients: dict[str, list[float]],
@@ -157,19 +223,23 @@ def maybe_save_plots(
 
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    options = ["loss"]
+    plot_epoch_diagnostics(
+        history,
+        option="loss",
+        save_path=fig_dir / "negative_log_likelihood_by_epoch.pdf",
+    )
     if history.get("marginal_w1_average") or history.get("marginal_w1_max"):
-        options.append("w1")
-    if history.get("expected_supremum_squared_error"):
-        options.append("e_sup")
-
-    for option in options:
         plot_epoch_diagnostics(
             history,
-            option=option,
-            save_path=fig_dir / f"{option}_by_epoch.pdf",
+            option="w1",
+            save_path=fig_dir / "w1_by_epoch.pdf",
         )
-
+    if history.get("expected_supremum_squared_error"):
+        plot_epoch_diagnostics(
+            history,
+            option="e_sup",
+            save_path=fig_dir / "e_sup_by_epoch.pdf",
+        )
     if history.get("constant_drift_values"):
         plot_constant_coefficient_history(
             history,
@@ -186,10 +256,14 @@ def maybe_save_plots(
         )
 
     n_paths = min(int(cfg.plots.n_paths), real_paths.size(0))
-    generator.eval()
+    sampling_backend = str(cfg.train.get("sampling_backend", cfg.model.get("sampling_backend", "torchsde")))
+    model.eval()
     with torch.no_grad():
-        y0 = real_paths[:n_paths, 0, :].to(device=device, dtype=ts.dtype)
-        generated = generator.sample_paths(ts.to(device), y0).detach().cpu()
+        generated = model.sample_paths(
+            ts.to(device=device),
+            batch_size=n_paths,
+            backend=sampling_backend,
+        ).detach().cpu()
     plot_real_generated_paths(
         ts.detach().cpu(),
         real_paths[:n_paths].detach().cpu(),
@@ -200,7 +274,7 @@ def maybe_save_plots(
     )
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="sdegan")
+@hydra.main(version_base=None, config_path="../configs", config_name="sde_ml")
 def main(cfg: DictConfig) -> dict[str, list[float]]:
     os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
     set_seed(int(cfg.seed))
@@ -222,67 +296,85 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
         drop_last=bool(cfg.data.drop_last),
     )
     simulator = build_simulator(cfg)
-    data = make_sdegan_dataset(
+    ts, paths, dataloader = make_path_dataloader(
         simulator=simulator,
-        config=data_config,
+        data_config=data_config,
         batch_size=int(cfg.train.batch_size),
-        shuffle=data_config.shuffle,
-        drop_last=data_config.drop_last,
         num_workers=int(cfg.data.num_workers),
     )
     run_logger.info(
         "Dataset prepared: simulator={}, data_size={}, t_size={}, batches={}",
         simulator.__class__.__name__,
-        data.data_size,
-        data.ts.numel(),
-        len(data.dataloader),
+        paths.size(-1),
+        ts.numel(),
+        len(dataloader),
     )
 
-    generator = SDEGenerator(
-        data_size=data.data_size,
-        noise_size=int(cfg.model.generator.noise_size),
-        noise_type=str(cfg.model.generator.noise_type),
-        drift_head=str(cfg.model.generator.drift_head),
-        diffusion_head=str(cfg.model.generator.diffusion_head),
-        drift_window_size=int(cfg.model.generator.drift_window_size),
-        diffusion_window_size=int(cfg.model.generator.diffusion_window_size),
-        hidden_size=int(cfg.model.generator.hidden_size),
-        num_layers=int(cfg.model.generator.num_layers),
-        drift_init=float(cfg.model.generator.drift_init),
-        diffusion_init=float(cfg.model.generator.diffusion_init),
-        drift_scale=float(cfg.model.generator.drift_scale),
-        diffusion_scale=float(cfg.model.generator.diffusion_scale),
-        final_tanh=bool(cfg.model.generator.final_tanh),
-        method=str(cfg.model.generator.method),
-        dt=cfg.model.generator.dt,
-    )
-    discriminator = CDEDiscriminator(
-        data_size=data.data_size,
-        hidden_size=int(cfg.model.discriminator.hidden_size),
-        mlp_size=int(cfg.model.discriminator.mlp_size),
-        num_layers=int(cfg.model.discriminator.num_layers),
-        method=str(cfg.model.discriminator.method),
-        dt=float(cfg.model.discriminator.dt),
-        adjoint=bool(cfg.model.discriminator.adjoint),
+    model_cfg = cfg.model
+    time_origin = resolve_time_origin(model_cfg.time_origin, ts)
+    time_scale = resolve_time_scale(model_cfg.time_scale, ts)
+    state_center = resolve_state_center(model_cfg.state_center, paths)
+    state_scale = resolve_state_scale(model_cfg.state_scale, paths)
+    input_clip = resolve_optional_float(model_cfg.input_clip)
+    model = SDEML(
+        data_size=paths.size(-1),
+        noise_size=int(model_cfg.noise_size),
+        noise_type=str(model_cfg.noise_type),
+        sde_type=str(model_cfg.sde_type),
+        drift_head=str(model_cfg.drift_head),
+        diffusion_head=str(model_cfg.diffusion_head),
+        drift_window_size=int(model_cfg.drift_window_size),
+        diffusion_window_size=int(model_cfg.diffusion_window_size),
+        hidden_size=int(model_cfg.hidden_size),
+        num_layers=int(model_cfg.num_layers),
+        drift_init=float(model_cfg.drift_init),
+        diffusion_init=float(model_cfg.diffusion_init),
+        drift_scale=float(model_cfg.drift_scale),
+        diffusion_scale=float(model_cfg.diffusion_scale),
+        final_tanh=bool(model_cfg.final_tanh),
+        variance_floor=float(model_cfg.variance_floor),
+        diffusion_min=float(model_cfg.diffusion_min),
+        initial_value=resolve_initial_value(model_cfg.initial_value, paths),
+        learn_initial=bool(model_cfg.learn_initial),
+        time_origin=time_origin,
+        time_scale=time_scale,
+        state_center=state_center,
+        state_scale=state_scale,
+        input_clip=input_clip,
+        method=str(model_cfg.method),
+        dt=model_cfg.dt,
+        adjoint=bool(model_cfg.adjoint),
+        sampling_backend=str(model_cfg.get("sampling_backend", "torchsde")),
     )
     run_logger.info(
-        "Models prepared: generator_params={}, discriminator_params={}",
-        sum(param.numel() for param in generator.parameters()),
-        sum(param.numel() for param in discriminator.parameters()),
+        "Model prepared: params={}, data_size={}, noise_type={}, sde_type={}, drift_head={}, diffusion_head={}",
+        sum(param.numel() for param in model.parameters()),
+        model.data_size,
+        model.noise_type,
+        model.sde_type,
+        model.drift_head_type,
+        model.diffusion_head_type,
+    )
+    run_logger.info(
+        "Model input scaling: time_origin={}, time_scale={}, state_center={}, state_scale={}, input_clip={}",
+        time_origin,
+        time_scale,
+        state_center,
+        state_scale,
+        input_clip,
     )
 
-    train_config = SDEGANTrainConfig(
+    train_config = SDEMLTrainConfig(
         epochs=int(cfg.train.epochs),
         steps=cfg.train.steps,
         steps_per_epoch=cfg.train.steps_per_epoch,
         batch_size=int(cfg.train.batch_size),
-        generator_lr=float(cfg.train.generator_lr),
-        discriminator_lr=float(cfg.train.discriminator_lr),
+        lr=float(cfg.train.lr),
         weight_decay=float(cfg.train.weight_decay),
         optimizer=str(cfg.train.optimizer),
-        n_critic=int(cfg.train.n_critic),
-        clip_discriminator=bool(cfg.train.clip_discriminator),
-        swa_start_step=cfg.train.swa_start_step,
+        adam_beta1=float(cfg.train.get("adam_beta1", 0.9)),
+        adam_beta2=float(cfg.train.get("adam_beta2", 0.999)),
+        grad_clip_norm=cfg.train.grad_clip_norm,
         log_every=int(cfg.train.log_every),
         eval_every=int(cfg.train.eval_every),
         metrics_every_epoch=int(cfg.evaluation.every_epoch) if bool(cfg.evaluation.enabled) else 0,
@@ -291,8 +383,10 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
         metrics_align_initial=bool(cfg.evaluation.align_initial),
         metrics_coupled_brownian=bool(cfg.evaluation.get("coupled_brownian", True)),
         metrics_brownian_seed=cfg.evaluation.get("brownian_seed"),
-        init_mult_initial=float(cfg.train.init_mult_initial),
-        init_mult_func=float(cfg.train.init_mult_func),
+        likelihood_backend=str(cfg.train.get("likelihood_backend", "direct")),
+        sampling_backend=str(cfg.train.get("sampling_backend", model.sampling_backend)),
+        include_initial_likelihood=bool(cfg.train.include_initial_likelihood),
+        initial_std=cfg.train.initial_std,
         checkpoint_path=checkpoint_path,
     )
     metric_simulator = None
@@ -305,15 +399,14 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
         else:
             metric_simulator = simulator
 
-    history = train_sdegan(
-        generator=generator,
-        discriminator=discriminator,
-        dataloader=data.dataloader,
-        ts=data.ts,
+    history = train_sde_ml(
+        model=model,
+        dataloader=dataloader,
+        ts=ts,
         device=device,
         logger=run_logger,
         config=train_config,
-        metric_real_paths=data.paths if bool(cfg.evaluation.enabled) else None,
+        metric_real_paths=paths if bool(cfg.evaluation.enabled) else None,
         metric_simulator=metric_simulator,
     )
 
@@ -321,9 +414,9 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
         cfg=cfg,
         fig_dir=run_paths.fig_dir,
         history=history,
-        generator=generator,
-        ts=data.ts,
-        real_paths=data.paths,
+        model=model,
+        ts=ts,
+        real_paths=paths,
         true_coefficients=true_constant_coefficients(simulator),
         device=device,
     )

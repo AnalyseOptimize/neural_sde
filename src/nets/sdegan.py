@@ -306,11 +306,19 @@ class SDEGenerator(nn.Module):
             return float(self.dt)
         return float((ts[1:] - ts[:-1]).min().detach().cpu())
 
-    def _sdeint_adjoint(self, y0: torch.Tensor, ts: torch.Tensor) -> torch.Tensor:
+    def _sdeint_adjoint(
+        self,
+        y0: torch.Tensor,
+        ts: torch.Tensor,
+        *,
+        bm=None,
+    ) -> torch.Tensor:
         kwargs = {
             "method": self.method,
             "dt": self._solver_dt(ts),
         }
+        if bm is not None:
+            kwargs["bm"] = bm
         if self.method == "reversible_heun":
             kwargs["adjoint_method"] = "adjoint_reversible_heun"
         return torchsde.sdeint_adjoint(self.func, y0, ts, **kwargs)
@@ -328,23 +336,29 @@ class SDEGenerator(nn.Module):
                 values.append(paths[source_idx])
         return torch.stack(values, dim=1)
 
-    def _sample_simple_or_constant(self, ts: torch.Tensor, y0: torch.Tensor) -> torch.Tensor:
+    def _sample_simple_or_constant(
+        self,
+        ts: torch.Tensor,
+        y0: torch.Tensor,
+        *,
+        bm=None,
+    ) -> torch.Tensor:
         self.func.set_fixed_lags(None)
-        ys = self._sdeint_adjoint(y0, ts)
+        ys = self._sdeint_adjoint(y0, ts, bm=bm)
         return ys.transpose(0, 1)
 
-    def _sample_window(self, ts: torch.Tensor, y0: torch.Tensor) -> torch.Tensor:
+    def _sample_window(self, ts: torch.Tensor, y0: torch.Tensor, *, bm=None) -> torch.Tensor:
         paths = [y0]
         for idx in range(1, ts.numel()):
             fixed_lags = self._make_fixed_lags(paths).to(device=y0.device, dtype=y0.dtype)
             self.func.set_fixed_lags(fixed_lags)
             interval_ts = ts[idx - 1 : idx + 1]
-            interval_ys = self._sdeint_adjoint(paths[-1], interval_ts)
+            interval_ys = self._sdeint_adjoint(paths[-1], interval_ts, bm=bm)
             paths.append(interval_ys[-1])
         self.func.set_fixed_lags(None)
         return torch.stack(paths, dim=1)
 
-    def sample_paths(self, ts: torch.Tensor, y0: torch.Tensor) -> torch.Tensor:
+    def sample_paths(self, ts: torch.Tensor, y0: torch.Tensor, *, bm=None) -> torch.Tensor:
         ts = _validate_ts(ts)
         if y0.ndim == 1:
             y0 = y0.unsqueeze(0)
@@ -355,8 +369,8 @@ class SDEGenerator(nn.Module):
 
         y0 = y0.to(device=ts.device, dtype=ts.dtype)
         if self.needs_discrete_window:
-            return self._sample_window(ts, y0)
-        return self._sample_simple_or_constant(ts, y0)
+            return self._sample_window(ts, y0, bm=bm)
+        return self._sample_simple_or_constant(ts, y0, bm=bm)
 
     def forward(self, ts: torch.Tensor, y0: torch.Tensor) -> torch.Tensor:
         return paths_to_coeffs(ts, self.sample_paths(ts, y0))
@@ -495,8 +509,8 @@ class SDEGAN(nn.Module):
         self.generator = generator
         self.discriminator = discriminator
 
-    def sample_paths(self, ts: torch.Tensor, y0: torch.Tensor) -> torch.Tensor:
-        return self.generator.sample_paths(ts, y0)
+    def sample_paths(self, ts: torch.Tensor, y0: torch.Tensor, *, bm=None) -> torch.Tensor:
+        return self.generator.sample_paths(ts, y0, bm=bm)
 
     def sample_coeffs(self, ts: torch.Tensor, y0: torch.Tensor) -> torch.Tensor:
         return self.generator(ts, y0)

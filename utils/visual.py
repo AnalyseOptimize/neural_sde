@@ -217,6 +217,17 @@ def _epoch_axis(history: dict, values: np.ndarray, *, preferred_key: str = "epoc
     return np.arange(1, values.size + 1, dtype=float)
 
 
+def _history_matrix(history: dict, key: str) -> np.ndarray:
+    if key not in history or len(history[key]) == 0:
+        return np.asarray([], dtype=float).reshape(0, 0)
+    values = np.asarray(history[key], dtype=float)
+    if values.ndim == 1:
+        values = values.reshape(-1, 1)
+    if values.ndim != 2:
+        raise ValueError(f"history[{key!r}] must be one- or two-dimensional")
+    return values
+
+
 def plot_epoch_diagnostics(
     history: dict,
     *,
@@ -240,12 +251,30 @@ def plot_epoch_diagnostics(
         if option == "loss":
             loss_g = _history_array(history, ("loss_g_epoch", "loss_g"))
             loss_d = _history_array(history, ("loss_d_epoch", "loss_d"))
-            if loss_g.size == 0 and loss_d.size == 0:
+            loss_ml = _history_array(
+                history,
+                (
+                    "negative_log_likelihood_per_step_epoch",
+                    "negative_log_likelihood_per_step",
+                    "negative_log_likelihood_epoch",
+                    "loss_epoch",
+                    "negative_log_likelihood",
+                    "loss",
+                ),
+            )
+            if loss_g.size == 0 and loss_d.size == 0 and loss_ml.size == 0:
                 raise ValueError("history does not contain loss values")
             if loss_d.size:
                 ax.plot(_epoch_axis(history, loss_d), loss_d, color="#1f77b4", label="Discriminator")
             if loss_g.size:
                 ax.plot(_epoch_axis(history, loss_g), loss_g, color="#d62728", label="Generator")
+            if loss_ml.size and loss_g.size == 0 and loss_d.size == 0:
+                ax.plot(
+                    _epoch_axis(history, loss_ml),
+                    loss_ml,
+                    color="#1f77b4",
+                    label="Negative log likelihood",
+                )
             ax.set_ylabel("Loss")
             ax.legend(frameon=False, loc="best")
 
@@ -289,6 +318,65 @@ def plot_epoch_diagnostics(
 
         ax.set_xlabel("Epoch")
         _format_axes(ax)
+        fig.tight_layout()
+    return _save_or_return(fig, save_path)
+
+
+def plot_constant_coefficient_history(
+    history: dict,
+    *,
+    coefficient: Literal["drift", "diffusion"],
+    true_value=None,
+    save_path: str | Path | None = None,
+):
+    """
+    Plot constant drift or diffusion coefficient estimates over epochs.
+    """
+
+    if coefficient not in {"drift", "diffusion"}:
+        raise ValueError("coefficient must be one of: drift, diffusion")
+
+    values = _history_matrix(history, f"constant_{coefficient}_values")
+    if values.size == 0:
+        raise ValueError(f"history does not contain constant {coefficient} values")
+
+    epochs = _history_array(history, (f"constant_{coefficient}_epoch", "epoch"))
+    if epochs.size != values.shape[0]:
+        epochs = np.arange(1, values.shape[0] + 1, dtype=float)
+
+    target = None
+    if true_value is not None:
+        target = np.asarray(_to_numpy(true_value), dtype=float).reshape(-1)
+        if target.size == 1 and values.shape[1] > 1:
+            target = np.repeat(target, values.shape[1])
+
+    with _scientific_style():
+        fig, ax = plt.subplots(figsize=(6.4, 3.6))
+        colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        pretty = "Drift" if coefficient == "drift" else "Diffusion"
+        for idx in range(values.shape[1]):
+            color = colors[idx % len(colors)]
+            label = pretty if values.shape[1] == 1 else f"{pretty} coefficient {idx + 1}"
+            ax.plot(epochs, values[:, idx], color=color, label=label)
+            if target is not None and idx < target.size:
+                true_label = (
+                    f"True {coefficient}"
+                    if values.shape[1] == 1
+                    else f"True {coefficient} {idx + 1}"
+                )
+                ax.axhline(
+                    target[idx],
+                    color=color,
+                    linestyle="--",
+                    linewidth=0.9,
+                    alpha=0.75,
+                    label=true_label,
+                )
+
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(f"{pretty} coefficient")
+        _format_axes(ax)
+        ax.legend(frameon=False, loc="best")
         fig.tight_layout()
     return _save_or_return(fig, save_path)
 

@@ -16,6 +16,13 @@ data:
 
 simulator:
   name: ou
+  abm:
+    dim: 1
+    s0: 0.0
+    mu: 0.1
+    sigma: 0.2
+    rho: 0.0
+    corr: null
   gbm:
     dim: 1
     s0: 1.0
@@ -81,6 +88,8 @@ evaluation:
   n_paths: 512
   num_quantiles: 1024
   align_initial: true
+  coupled_brownian: true
+  brownian_seed: 0
 
 plots:
   enabled: true
