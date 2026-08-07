@@ -22,12 +22,14 @@ from src.simulators import (
     DeterministicDriftSimulator,
     MultiDimensionalGBMSimulator,
     OUSimulator,
+    PerturbedPathSimulator,
 )
 from src.train import SDEMLTrainConfig, train_sde_ml
 from utils.data import PathDataConfig, normalize_paths_by_initial, validate_paths
 from utils.logging import log_config, setup_logger
 from utils.visual import (
     plot_constant_coefficient_history,
+    plot_constant_diffusion_covariance_history,
     plot_epoch_diagnostics,
     plot_real_generated_paths,
 )
@@ -63,6 +65,58 @@ def _build_equicorrelation(dim: int, rho: float) -> list[list[float]] | None:
     return [[1.0 if i == j else rho for j in range(dim)] for i in range(dim)]
 
 
+def maybe_add_perturbations(simulator, cfg: DictConfig):
+    perturbations = cfg.simulator.get("perturbations")
+    if perturbations is None:
+        return simulator
+
+    data_size = int(simulator.data_size)
+    gaussian = perturbations.get("gaussian", {})
+    jumps = perturbations.get("jumps", {})
+
+    gaussian_enabled = bool(gaussian.get("enabled", False))
+    jump_enabled = bool(jumps.get("enabled", False))
+
+    gaussian_variance = 0.0
+    gaussian_include_initial = True
+    gaussian_seed = None
+    if gaussian_enabled:
+        gaussian_variance = _as_float_or_list(
+            gaussian.get("variance", 0.0),
+            dim=data_size,
+            name="simulator.perturbations.gaussian.variance",
+        )
+        gaussian_include_initial = bool(gaussian.get("include_initial", True))
+        gaussian_seed = gaussian.get("seed")
+        if gaussian_seed is None:
+            gaussian_seed = int(cfg.seed) + 100_003
+
+    jump_intensity = 0.0
+    jump_size = 1.0
+    jump_seed = None
+    if jump_enabled:
+        jump_intensity = float(jumps.get("intensity", 0.0))
+        jump_size = _as_float_or_list(
+            jumps.get("size", 1.0),
+            dim=data_size,
+            name="simulator.perturbations.jumps.size",
+        )
+        jump_seed = jumps.get("seed")
+        if jump_seed is None:
+            jump_seed = int(cfg.seed) + 200_003
+
+    perturbed = PerturbedPathSimulator(
+        base=simulator,
+        gaussian_variance=gaussian_variance,
+        gaussian_include_initial=gaussian_include_initial,
+        gaussian_seed=None if gaussian_seed is None else int(gaussian_seed),
+        jump_intensity=jump_intensity,
+        jump_size=jump_size,
+        jump_seed=None if jump_seed is None else int(jump_seed),
+    )
+    return perturbed if perturbed.has_perturbations else simulator
+
+
 def resolve_device(device: str) -> torch.device:
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -89,7 +143,7 @@ def build_simulator(cfg: DictConfig):
             corr = _to_container(abm.corr)
         elif dim > 1:
             corr = _build_equicorrelation(dim, float(abm.rho))
-        return ArithmeticBrownianMotionSimulator(
+        simulator = ArithmeticBrownianMotionSimulator(
             s0=_as_float_or_list(abm.s0, dim=dim, name="abm.s0"),
             mu=_as_float_or_list(abm.mu, dim=dim, name="abm.mu"),
             sigma=_as_float_or_list(abm.sigma, dim=dim, name="abm.sigma"),
@@ -97,6 +151,7 @@ def build_simulator(cfg: DictConfig):
             corr=corr,
             seed=int(cfg.seed),
         )
+        return maybe_add_perturbations(simulator, cfg)
 
     if name == "gbm":
         gbm = cfg.simulator.gbm
@@ -106,7 +161,7 @@ def build_simulator(cfg: DictConfig):
             corr = _to_container(gbm.corr)
         elif dim > 1:
             corr = _build_equicorrelation(dim, float(gbm.rho))
-        return MultiDimensionalGBMSimulator(
+        simulator = MultiDimensionalGBMSimulator(
             s0=_as_float_or_list(gbm.s0, dim=dim, name="gbm.s0"),
             mu=_as_float_or_list(gbm.mu, dim=dim, name="gbm.mu"),
             sigma=_as_float_or_list(gbm.sigma, dim=dim, name="gbm.sigma"),
@@ -114,22 +169,25 @@ def build_simulator(cfg: DictConfig):
             corr=corr,
             seed=int(cfg.seed),
         )
+        return maybe_add_perturbations(simulator, cfg)
 
     if name == "deterministic":
         det = cfg.simulator.deterministic
-        return DeterministicDriftSimulator(s0=float(det.s0), mu=float(det.mu))
+        simulator = DeterministicDriftSimulator(s0=float(det.s0), mu=float(det.mu))
+        return maybe_add_perturbations(simulator, cfg)
 
     if name != "ou":
         raise ValueError(f"Unsupported simulator: {name}")
 
     ou = cfg.simulator.ou
-    return OUSimulator(
+    simulator = OUSimulator(
         s0=float(ou.s0),
         theta=float(ou.theta),
         mu=float(ou.mu),
         sigma=float(ou.sigma),
         seed=int(cfg.seed),
     )
+    return maybe_add_perturbations(simulator, cfg)
 
 
 def true_constant_coefficients(simulator) -> dict[str, list[float]]:
@@ -254,6 +312,30 @@ def maybe_save_plots(
             true_value=true_coefficients.get("diffusion"),
             save_path=fig_dir / "constant_diffusion_by_epoch.pdf",
         )
+        if (
+            str(cfg.simulator.name) == "abm"
+            and int(cfg.simulator.abm.dim) > 1
+            and str(cfg.model.diffusion_head) == "constant"
+        ):
+            noise_type = str(cfg.model.noise_type).lower()
+            data_size = int(cfg.simulator.abm.dim)
+            noise_size = data_size if noise_type == "diagonal" else int(cfg.model.noise_size)
+            true_diffusion_target = true_coefficients.get("diffusion_covariance")
+            true_diffusion_target_kind = "covariance"
+            if true_diffusion_target is None:
+                true_diffusion_target = true_coefficients.get("diffusion_matrix")
+                true_diffusion_target_kind = "diffusion"
+            if true_diffusion_target is None:
+                true_diffusion_target = true_coefficients.get("diffusion")
+                true_diffusion_target_kind = "diffusion"
+            plot_constant_diffusion_covariance_history(
+                history,
+                diffusion_shape=(data_size, noise_size),
+                diagonal=noise_type == "diagonal",
+                true_value=true_diffusion_target,
+                true_value_kind=true_diffusion_target_kind,
+                save_path=fig_dir / "constant_diffusion_covariance_by_epoch.pdf",
+            )
 
     n_paths = min(int(cfg.plots.n_paths), real_paths.size(0))
     sampling_backend = str(cfg.train.get("sampling_backend", cfg.model.get("sampling_backend", "torchsde")))
@@ -316,10 +398,20 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
     state_center = resolve_state_center(model_cfg.state_center, paths)
     state_scale = resolve_state_scale(model_cfg.state_scale, paths)
     input_clip = resolve_optional_float(model_cfg.input_clip)
+    noise_type = str(model_cfg.noise_type)
+    noise_size = int(model_cfg.noise_size)
+    diffusion_init_size = (
+        paths.size(-1) if noise_type.lower() == "diagonal" else paths.size(-1) * noise_size
+    )
+    diffusion_init = _as_float_or_list(
+        model_cfg.diffusion_init,
+        dim=diffusion_init_size,
+        name="model.diffusion_init",
+    )
     model = SDEML(
         data_size=paths.size(-1),
-        noise_size=int(model_cfg.noise_size),
-        noise_type=str(model_cfg.noise_type),
+        noise_size=noise_size,
+        noise_type=noise_type,
         sde_type=str(model_cfg.sde_type),
         drift_head=str(model_cfg.drift_head),
         diffusion_head=str(model_cfg.diffusion_head),
@@ -328,7 +420,7 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
         hidden_size=int(model_cfg.hidden_size),
         num_layers=int(model_cfg.num_layers),
         drift_init=float(model_cfg.drift_init),
-        diffusion_init=float(model_cfg.diffusion_init),
+        diffusion_init=diffusion_init,
         drift_scale=float(model_cfg.drift_scale),
         diffusion_scale=float(model_cfg.diffusion_scale),
         final_tanh=bool(model_cfg.final_tanh),

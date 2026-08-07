@@ -1,4 +1,4 @@
-run_name: sde_ml_ou_simple
+run_name: sde_ml_mabm_constant_jumps
 seed: 0
 device: auto
 
@@ -15,20 +15,20 @@ data:
   num_workers: 0
 
 simulator:
-  name: ou
+  name: abm
   abm:
-    dim: 1
+    dim: 2
     s0: 0.0
     mu: 0.1
     sigma: 0.2
-    rho: 0.0
+    rho: 0.5
     corr: null
   gbm:
     dim: 1
     s0: 1.0
     mu: 0.05
     sigma: 0.2
-    rho: 0.0
+    rho: 0.5
     corr: null
   ou:
     s0: 1.0
@@ -38,13 +38,24 @@ simulator:
   deterministic:
     s0: 0.0
     mu: 0.1
+  perturbations:
+    gaussian:
+      enabled: false
+      variance: 0.01
+      include_initial: true
+      seed: null
+    jumps:
+      enabled: true
+      intensity: 0.01
+      size: 1.0
+      seed: null
 
 model:
-  noise_size: 1
-  noise_type: diagonal
+  noise_size: 2
+  noise_type: general
   sde_type: ito
-  drift_head: simple
-  diffusion_head: simple
+  drift_head: constant
+  diffusion_head: constant
   drift_window_size: 1
   diffusion_window_size: 1
   hidden_size: 8

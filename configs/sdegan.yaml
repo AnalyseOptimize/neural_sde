@@ -1,4 +1,4 @@
-run_name: sdegan_ou
+run_name: sdegan_abm
 seed: 0
 device: auto
 
@@ -9,19 +9,19 @@ data:
   dataset_size: 8192
   t_size: 64
   dt: 1.0
-  normalize: true
+  normalize: false
   shuffle: true
   drop_last: true
   num_workers: 0
 
 simulator:
-  name: ou
+  name: abm
   abm:
-    dim: 1
+    dim: 2
     s0: 0.0
     mu: 0.1
     sigma: 0.2
-    rho: 0.0
+    rho: 0.5
     corr: null
   gbm:
     dim: 1
@@ -38,22 +38,33 @@ simulator:
   deterministic:
     s0: 0.0
     mu: 0.1
+  perturbations:
+    gaussian:
+      enabled: false
+      variance: 0.0
+      include_initial: true
+      seed: null
+    jumps:
+      enabled: false
+      intensity: 0.0
+      size: 1.0
+      seed: null
 
 model:
   generator:
-    noise_size: 1
-    noise_type: diagonal
-    drift_head: simple
-    diffusion_head: simple
+    noise_size: 2
+    noise_type: general
+    drift_head: constant
+    diffusion_head: constant
     drift_window_size: 1
     diffusion_window_size: 1
-    hidden_size: 32
-    num_layers: 2
+    hidden_size: 16
+    num_layers: 1
     drift_init: 0.0
     diffusion_init: 0.1
     drift_scale: 1.0
     diffusion_scale: 1.0
-    final_tanh: true
+    final_tanh: false
     method: reversible_heun
     dt: null
   discriminator:
@@ -63,19 +74,27 @@ model:
     method: reversible_heun
     dt: 1.0
     adjoint: true
+    func_final_tanh: false
+    initial_final_tanh: false
+    readout_mode: interval
 
 train:
-  epochs: 100
+  epochs: 150
   steps: null
   steps_per_epoch: null
   batch_size: 1024
-  generator_lr: 2.0e-4
-  discriminator_lr: 1.0e-3
-  weight_decay: 1.0e-2
-  optimizer: adadelta
+  generator_lr: 1.0e-4
+  discriminator_lr: 1.0e-1
+  weight_decay: 0.0
+  optimizer: adam
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  scheduler: step
+  scheduler_step_size: 800
+  scheduler_gamma: 0.8
   n_critic: 1
   clip_discriminator: true
-  swa_start_step: 5000
+  swa_start_step: null
   log_every: 10
   eval_every: 0
   init_mult_initial: 1.0

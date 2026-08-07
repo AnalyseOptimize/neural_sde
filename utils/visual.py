@@ -381,6 +381,280 @@ def plot_constant_coefficient_history(
     return _save_or_return(fig, save_path)
 
 
+def _diffusion_history_as_matrices(
+    values: np.ndarray,
+    *,
+    matrix_shape: tuple[int, int],
+    diagonal: bool,
+) -> np.ndarray:
+    rows, cols = matrix_shape
+    if rows < 1 or cols < 1:
+        raise ValueError("matrix_shape entries must be positive")
+
+    if values.shape[1] == rows * cols:
+        return values.reshape(values.shape[0], rows, cols)
+
+    if diagonal and rows == cols and values.shape[1] == rows:
+        matrices = np.zeros((values.shape[0], rows, cols), dtype=float)
+        diag_idx = np.arange(rows)
+        matrices[:, diag_idx, diag_idx] = values
+        return matrices
+
+    raise ValueError(
+        "constant_diffusion_values cannot be reshaped into the requested matrix: "
+        f"got {values.shape[1]} coefficients, expected {rows * cols}"
+        + (f" or {rows} diagonal coefficients" if diagonal and rows == cols else "")
+    )
+
+
+def _target_as_matrix(
+    true_value,
+    *,
+    matrix_shape: tuple[int, int],
+    diagonal: bool,
+) -> np.ndarray | None:
+    if true_value is None:
+        return None
+
+    rows, cols = matrix_shape
+    target = np.asarray(_to_numpy(true_value), dtype=float)
+    if target.shape == (rows, cols):
+        return target
+
+    flat = target.reshape(-1)
+    if flat.size == rows * cols:
+        return flat.reshape(rows, cols)
+    if diagonal and rows == cols and flat.size == rows:
+        return np.diag(flat)
+    if rows == cols and flat.size == 1:
+        return np.eye(rows, dtype=float) * float(flat[0])
+
+    raise ValueError(
+        "true_value cannot be reshaped into the requested diffusion matrix: "
+        f"got {flat.size} entries, expected {rows * cols}"
+        + (f" or {rows} diagonal entries" if diagonal and rows == cols else "")
+    )
+
+
+def plot_constant_diffusion_matrix_history(
+    history: dict,
+    *,
+    matrix_shape: tuple[int, int],
+    diagonal: bool = False,
+    true_value=None,
+    save_path: str | Path | None = None,
+):
+    """
+    Plot every entry of a constant diffusion matrix over epochs.
+    """
+
+    values = _history_matrix(history, "constant_diffusion_values")
+    if values.size == 0:
+        raise ValueError("history does not contain constant diffusion values")
+
+    rows, cols = matrix_shape
+    matrices = _diffusion_history_as_matrices(
+        values,
+        matrix_shape=(rows, cols),
+        diagonal=diagonal,
+    )
+    target = _target_as_matrix(
+        true_value,
+        matrix_shape=(rows, cols),
+        diagonal=diagonal,
+    )
+
+    epochs = _history_array(history, ("constant_diffusion_epoch", "epoch"))
+    if epochs.size != matrices.shape[0]:
+        epochs = np.arange(1, matrices.shape[0] + 1, dtype=float)
+
+    with _scientific_style():
+        fig, axes = plt.subplots(
+            rows,
+            cols,
+            figsize=(max(6.4, 2.15 * cols), max(3.6, 1.85 * rows)),
+            sharex=True,
+            squeeze=False,
+        )
+        learned_color = "#1f77b4"
+        true_color = "#d62728"
+        handles = []
+        labels = []
+
+        for row in range(rows):
+            for col in range(cols):
+                ax = axes[row, col]
+                (learned_line,) = ax.plot(
+                    epochs,
+                    matrices[:, row, col],
+                    color=learned_color,
+                    label="Estimated",
+                )
+                if not handles:
+                    handles.append(learned_line)
+                    labels.append("Estimated")
+
+                if target is not None:
+                    true_line = ax.axhline(
+                        target[row, col],
+                        color=true_color,
+                        linestyle="--",
+                        linewidth=0.9,
+                        alpha=0.8,
+                        label="True",
+                    )
+                    if len(handles) == 1:
+                        handles.append(true_line)
+                        labels.append("True")
+
+                ax.set_title(rf"$\sigma_{{{row + 1},{col + 1}}}$")
+                if row == rows - 1:
+                    ax.set_xlabel("Epoch")
+                if col == 0:
+                    ax.set_ylabel("Diffusion coefficient")
+                _format_axes(ax)
+
+        if handles:
+            fig.legend(handles, labels, frameon=False, loc="upper center", ncol=len(handles))
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    return _save_or_return(fig, save_path)
+
+
+def _target_as_covariance(
+    true_value,
+    *,
+    diffusion_shape: tuple[int, int],
+    diagonal: bool,
+    true_value_kind: Literal["diffusion", "covariance"],
+) -> np.ndarray | None:
+    if true_value is None:
+        return None
+    if true_value_kind not in {"diffusion", "covariance"}:
+        raise ValueError("true_value_kind must be one of: diffusion, covariance")
+
+    rows, cols = diffusion_shape
+    target = np.asarray(_to_numpy(true_value), dtype=float)
+    flat = target.reshape(-1)
+
+    if true_value_kind == "covariance":
+        if target.shape == (rows, rows):
+            return target
+        if flat.size == rows * rows:
+            return flat.reshape(rows, rows)
+        if diagonal and flat.size == rows:
+            return np.diag(flat)
+        if flat.size == 1:
+            return np.eye(rows, dtype=float) * float(flat[0])
+        raise ValueError(
+            "true_value cannot be interpreted as a covariance target: "
+            f"got {flat.size} entries, expected {rows * rows}"
+            + (f", or {rows} diagonal covariance entries" if diagonal else "")
+        )
+
+    if target.shape == (rows, cols):
+        return target @ target.T
+    if flat.size == rows * cols:
+        sigma = flat.reshape(rows, cols)
+        return sigma @ sigma.T
+    if diagonal and flat.size == rows:
+        return np.diag(flat**2)
+    if flat.size == 1:
+        return np.eye(rows, dtype=float) * float(flat[0]) ** 2
+
+    raise ValueError(
+        "true_value cannot be interpreted as a covariance target: "
+        f"got {flat.size} entries, expected {rows * rows}, {rows * cols}"
+        + (f", or {rows} diagonal coefficients" if diagonal else "")
+    )
+
+
+def plot_constant_diffusion_covariance_history(
+    history: dict,
+    *,
+    diffusion_shape: tuple[int, int],
+    diagonal: bool = False,
+    true_value=None,
+    true_value_kind: Literal["diffusion", "covariance"] = "diffusion",
+    save_path: str | Path | None = None,
+):
+    """
+    Plot every entry of Sigma Sigma^T for a constant diffusion coefficient.
+    """
+
+    values = _history_matrix(history, "constant_diffusion_values")
+    if values.size == 0:
+        raise ValueError("history does not contain constant diffusion values")
+
+    rows, cols = diffusion_shape
+    sigma = _diffusion_history_as_matrices(
+        values,
+        matrix_shape=(rows, cols),
+        diagonal=diagonal,
+    )
+    covariance = sigma @ np.swapaxes(sigma, 1, 2)
+    target = _target_as_covariance(
+        true_value,
+        diffusion_shape=(rows, cols),
+        diagonal=diagonal,
+        true_value_kind=true_value_kind,
+    )
+
+    epochs = _history_array(history, ("constant_diffusion_epoch", "epoch"))
+    if epochs.size != covariance.shape[0]:
+        epochs = np.arange(1, covariance.shape[0] + 1, dtype=float)
+
+    with _scientific_style():
+        fig, axes = plt.subplots(
+            rows,
+            rows,
+            figsize=(max(6.4, 2.15 * rows), max(3.6, 1.85 * rows)),
+            sharex=True,
+            squeeze=False,
+        )
+        learned_color = "#1f77b4"
+        true_color = "#d62728"
+        handles = []
+        labels = []
+
+        for row in range(rows):
+            for col in range(rows):
+                ax = axes[row, col]
+                (learned_line,) = ax.plot(
+                    epochs,
+                    covariance[:, row, col],
+                    color=learned_color,
+                    label="Estimated",
+                )
+                if not handles:
+                    handles.append(learned_line)
+                    labels.append("Estimated")
+
+                if target is not None:
+                    true_line = ax.axhline(
+                        target[row, col],
+                        color=true_color,
+                        linestyle="--",
+                        linewidth=0.9,
+                        alpha=0.8,
+                        label="True",
+                    )
+                    if len(handles) == 1:
+                        handles.append(true_line)
+                        labels.append("True")
+
+                ax.set_title(rf"$(\Sigma \Sigma^\top)_{{{row + 1},{col + 1}}}$")
+                if row == rows - 1:
+                    ax.set_xlabel("Epoch")
+                if col == 0:
+                    ax.set_ylabel("Noise covariance")
+                _format_axes(ax)
+
+        if handles:
+            fig.legend(handles, labels, frameon=False, loc="upper center", ncol=len(handles))
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    return _save_or_return(fig, save_path)
+
+
 def plot_loss_history(history: dict, *, save_path: str | Path | None = None):
     return plot_epoch_diagnostics(history, option="loss", save_path=save_path)
 

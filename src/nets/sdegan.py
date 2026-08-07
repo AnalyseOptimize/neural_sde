@@ -50,10 +50,46 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+def _as_init_vector(
+    value: float | list[float] | tuple[float, ...] | torch.Tensor,
+    *,
+    size: int,
+    name: str,
+) -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.float32).flatten()
+    if tensor.numel() == 1:
+        tensor = tensor.expand(size).clone()
+    if tensor.numel() != size:
+        raise ValueError(f"{name} must be scalar or have length {size}, got {tensor.numel()}")
+    return tensor
+
+
+def _general_diffusion_init(
+    value: float | list[float] | tuple[float, ...] | torch.Tensor,
+    *,
+    data_size: int,
+    noise_size: int,
+) -> float | torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.float32).flatten()
+    if tensor.numel() != 1:
+        return tensor
+
+    matrix = torch.zeros(data_size, noise_size, dtype=torch.float32)
+    diag_size = min(data_size, noise_size)
+    diag_idx = torch.arange(diag_size)
+    matrix[diag_idx, diag_idx] = tensor.item()
+    return matrix.reshape(-1)
+
+
 class ConstantCoefficientHead(nn.Module):
-    def __init__(self, out_size: int, *, init_value: float = 1.0) -> None:
+    def __init__(
+        self,
+        out_size: int,
+        *,
+        init_value: float | list[float] | tuple[float, ...] | torch.Tensor = 1.0,
+    ) -> None:
         super().__init__()
-        self.value = nn.Parameter(torch.full((out_size,), float(init_value)))
+        self.value = nn.Parameter(_as_init_vector(init_value, size=out_size, name="init_value"))
 
     def forward(self, t: torch.Tensor, window: torch.Tensor) -> torch.Tensor:
         return self.value.view(1, -1).expand(window.size(0), -1)
@@ -95,7 +131,7 @@ def _build_coefficient_head(
     hidden_size: int,
     num_layers: int,
     window_size: int,
-    init_value: float,
+    init_value: float | list[float] | tuple[float, ...] | torch.Tensor,
     final_tanh: bool,
     output_scale: float,
 ) -> nn.Module:
@@ -140,8 +176,8 @@ class ConditionalGeneratorFunc(nn.Module):
         diffusion_window_size: int,
         hidden_size: int,
         num_layers: int,
-        drift_init: float,
-        diffusion_init: float,
+        drift_init: float | list[float] | tuple[float, ...] | torch.Tensor,
+        diffusion_init: float | list[float] | tuple[float, ...] | torch.Tensor,
         drift_scale: float,
         diffusion_scale: float,
         final_tanh: bool,
@@ -218,8 +254,8 @@ class SDEGeneratorConfig:
     diffusion_window_size: int = 1
     hidden_size: int = 32
     num_layers: int = 2
-    drift_init: float = 0.0
-    diffusion_init: float = 0.1
+    drift_init: float | list[float] | tuple[float, ...] = 0.0
+    diffusion_init: float | list[float] | tuple[float, ...] = 0.1
     drift_scale: float = 1.0
     diffusion_scale: float = 1.0
     final_tanh: bool = True
@@ -240,8 +276,8 @@ class SDEGenerator(nn.Module):
         diffusion_window_size: int = 1,
         hidden_size: int = 32,
         num_layers: int = 2,
-        drift_init: float = 0.0,
-        diffusion_init: float = 0.1,
+        drift_init: float | list[float] | tuple[float, ...] | torch.Tensor = 0.0,
+        diffusion_init: float | list[float] | tuple[float, ...] | torch.Tensor = 0.1,
         drift_scale: float = 1.0,
         diffusion_scale: float = 1.0,
         final_tanh: bool = True,
@@ -267,6 +303,13 @@ class SDEGenerator(nn.Module):
             raise ValueError("noise_type must be either diagonal or general")
         if self.noise_type == "diagonal" and self.noise_size != self.data_size:
             self.noise_size = self.data_size
+
+        if self.diffusion_head_type == "constant" and self.noise_type == "general":
+            diffusion_init = _general_diffusion_init(
+                diffusion_init,
+                data_size=self.data_size,
+                noise_size=self.noise_size,
+            )
 
         self.func = ConditionalGeneratorFunc(
             data_size=self.data_size,
@@ -412,6 +455,8 @@ class CDEDiscriminatorFunc(nn.Module):
         hidden_size: int,
         mlp_size: int,
         num_layers: int,
+        *,
+        final_tanh: bool = False,
     ) -> None:
         super().__init__()
         self.data_size = int(data_size)
@@ -421,7 +466,7 @@ class CDEDiscriminatorFunc(nn.Module):
             hidden_size * (1 + data_size),
             mlp_size,
             num_layers,
-            final_tanh=True,
+            final_tanh=final_tanh,
         )
 
     def forward(self, t: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
@@ -439,6 +484,9 @@ class CDEDiscriminatorConfig:
     method: str = "reversible_heun"
     adjoint: bool = True
     dt: float = 1.0
+    func_final_tanh: bool = False
+    initial_final_tanh: bool = False
+    readout_mode: str = "interval"
 
 
 class CDEDiscriminator(nn.Module):
@@ -452,22 +500,35 @@ class CDEDiscriminator(nn.Module):
         method: str = "reversible_heun",
         adjoint: bool = True,
         dt: float = 1.0,
+        func_final_tanh: bool = False,
+        initial_final_tanh: bool = False,
+        readout_mode: str = "interval",
     ) -> None:
         super().__init__()
         self.data_size = int(data_size)
         self.method = method
         self.adjoint = bool(adjoint)
         self.dt = float(dt)
+        self.readout_mode = readout_mode.lower()
+        if self.readout_mode not in {"final", "interval"}:
+            raise ValueError("readout_mode must be either final or interval")
 
         self.initial = MLP(
             1 + data_size,
             hidden_size,
             mlp_size,
             num_layers,
-            final_tanh=False,
+            final_tanh=initial_final_tanh,
         )
-        self.func = CDEDiscriminatorFunc(data_size, hidden_size, mlp_size, num_layers)
-        self.readout = nn.Linear(hidden_size, 1)
+        self.func = CDEDiscriminatorFunc(
+            data_size,
+            hidden_size,
+            mlp_size,
+            num_layers,
+            final_tanh=func_final_tanh,
+        )
+        readout_size = hidden_size if self.readout_mode == "final" else 2 * hidden_size
+        self.readout = nn.Linear(readout_size, 1)
 
     @classmethod
     def from_config(cls, config: CDEDiscriminatorConfig) -> "CDEDiscriminator":
@@ -493,7 +554,11 @@ class CDEDiscriminator(nn.Module):
                 kwargs["adjoint_method"] = "adjoint_reversible_heun"
 
         hs = torchcde.cdeint(path, self.func, h0, path.interval, **kwargs)
-        return self.readout(hs[:, -1]).squeeze(-1)
+        if self.readout_mode == "final":
+            features = hs[:, -1]
+        else:
+            features = hs.reshape(hs.size(0), -1)
+        return self.readout(features).squeeze(-1)
 
     def mean_score(self, ys_coeffs: torch.Tensor) -> torch.Tensor:
         return self(ys_coeffs).mean()

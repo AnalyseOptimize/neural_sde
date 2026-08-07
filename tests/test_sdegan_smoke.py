@@ -133,24 +133,22 @@ def test_train_sdegan_constant_model_smoke_on_0_100_and_reports_shapes() -> None
     _print_shape("[pre-train generator.forward] generated coefficients", generated_before_training)
 
     with torch.no_grad():
-        fake_for_discriminator = generator(data.ts, batch_y0)
+        fake_for_joint_step = generator(data.ts, batch_y0)
         real_scores = discriminator(real_coeffs)
-        fake_scores = discriminator(fake_for_discriminator)
-        discriminator_loss = fake_scores.mean() - real_scores.mean()
-
-        fake_for_generator = generator(data.ts, batch_y0)
-        generator_scores = discriminator(fake_for_generator)
-        generator_loss = -generator_scores.mean()
+        fake_scores = discriminator(fake_for_joint_step)
+        joint_wgan_loss = fake_scores.mean() - real_scores.mean()
+        generator_loss_after_gradient_flip = -fake_scores.mean()
 
     _print_shape("[train-step trace] real coefficients", real_coeffs)
     _print_shape("[train-step trace] y0 conditioning", batch_y0)
-    _print_shape("[train-step trace] fake coefficients for discriminator", fake_for_discriminator)
+    _print_shape("[train-step trace] fake coefficients", fake_for_joint_step)
     _print_shape("[train-step trace] discriminator(real)", real_scores)
     _print_shape("[train-step trace] discriminator(fake)", fake_scores)
-    _print_shape("[train-step trace] discriminator loss", discriminator_loss)
-    _print_shape("[train-step trace] fake coefficients for generator", fake_for_generator)
-    _print_shape("[train-step trace] discriminator(fake_for_generator)", generator_scores)
-    _print_shape("[train-step trace] generator loss", generator_loss)
+    _print_shape("[train-step trace] joint WGAN loss", joint_wgan_loss)
+    _print_shape(
+        "[train-step trace] generator loss after gradient flip",
+        generator_loss_after_gradient_flip,
+    )
 
     train_config = SDEGANTrainConfig(
         epochs=2,
@@ -161,6 +159,9 @@ def test_train_sdegan_constant_model_smoke_on_0_100_and_reports_shapes() -> None
         discriminator_lr=1e-3,
         weight_decay=0.0,
         optimizer="adam",
+        adam_beta1=0.9,
+        adam_beta2=0.999,
+        scheduler=None,
         n_critic=1,
         clip_discriminator=True,
         swa_start_step=None,

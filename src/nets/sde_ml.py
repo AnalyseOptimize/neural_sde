@@ -77,6 +77,37 @@ def _as_1d_tensor(
     return tensor
 
 
+def _as_init_vector(
+    value: float | list[float] | tuple[float, ...] | torch.Tensor,
+    *,
+    size: int,
+    name: str,
+) -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.float32).flatten()
+    if tensor.numel() == 1:
+        tensor = tensor.expand(size).clone()
+    if tensor.numel() != size:
+        raise ValueError(f"{name} must be scalar or have length {size}, got {tensor.numel()}")
+    return tensor
+
+
+def _general_diffusion_init(
+    value: float | list[float] | tuple[float, ...] | torch.Tensor,
+    *,
+    data_size: int,
+    noise_size: int,
+) -> float | torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.float32).flatten()
+    if tensor.numel() != 1:
+        return tensor
+
+    matrix = torch.zeros(data_size, noise_size, dtype=torch.float32)
+    diag_size = min(data_size, noise_size)
+    diag_idx = torch.arange(diag_size)
+    matrix[diag_idx, diag_idx] = tensor.item()
+    return matrix.reshape(-1)
+
+
 def _inverse_softplus(value: torch.Tensor) -> torch.Tensor:
     value = value.clamp_min(1e-12)
     return torch.log(torch.expm1(value))
@@ -112,7 +143,7 @@ class SDEMLConfig:
     hidden_size: int = 32
     num_layers: int = 2
     drift_init: float = 0.0
-    diffusion_init: float = 0.1
+    diffusion_init: float | list[float] | tuple[float, ...] = 0.1
     drift_scale: float = 1.0
     diffusion_scale: float = 1.0
     final_tanh: bool = True
@@ -136,7 +167,7 @@ class ConstantCoefficientHead(nn.Module):
         self,
         out_size: int,
         *,
-        init_value: float,
+        init_value: float | list[float] | tuple[float, ...] | torch.Tensor,
         output_scale: float,
         positive: bool = False,
         min_value: float = 0.0,
@@ -148,11 +179,12 @@ class ConstantCoefficientHead(nn.Module):
         if self.positive and self.output_scale <= 0:
             raise ValueError("output_scale must be positive for positive coefficient heads")
 
+        init = _as_init_vector(init_value, size=out_size, name="init_value")
         if self.positive:
-            target = (float(init_value) - self.min_value) / self.output_scale
-            raw_init = _inverse_softplus(torch.full((out_size,), target))
+            target = (init - self.min_value) / self.output_scale
+            raw_init = _inverse_softplus(target)
         else:
-            raw_init = torch.full((out_size,), float(init_value) / self.output_scale)
+            raw_init = init / self.output_scale
         self.raw_value = nn.Parameter(raw_init)
 
     def _transform(self, raw: torch.Tensor) -> torch.Tensor:
@@ -174,7 +206,7 @@ class MLPCoefficientHead(nn.Module):
         hidden_size: int,
         num_layers: int,
         *,
-        init_value: float,
+        init_value: float | list[float] | tuple[float, ...] | torch.Tensor,
         output_scale: float,
         final_tanh: bool = False,
         positive: bool = False,
@@ -198,11 +230,12 @@ class MLPCoefficientHead(nn.Module):
         self.final_tanh = bool(final_tanh) and not self.positive
 
         nn.init.normal_(self.final.weight, mean=0.0, std=float(final_weight_std))
+        init = _as_init_vector(init_value, size=out_size, name="init_value")
         if self.positive:
-            target = (float(init_value) - self.min_value) / self.output_scale
-            raw_bias = _inverse_softplus(torch.full((out_size,), target))
+            target = (init - self.min_value) / self.output_scale
+            raw_bias = _inverse_softplus(target)
         else:
-            raw_bias = torch.full((out_size,), float(init_value) / self.output_scale)
+            raw_bias = init / self.output_scale
         with torch.no_grad():
             self.final.bias.copy_(raw_bias)
 
@@ -229,7 +262,7 @@ def _build_coefficient_head(
     hidden_size: int,
     num_layers: int,
     window_size: int,
-    init_value: float,
+    init_value: float | list[float] | tuple[float, ...] | torch.Tensor,
     final_tanh: bool,
     output_scale: float,
     positive: bool,
@@ -288,7 +321,7 @@ class ObservableSDEFunc(nn.Module):
         hidden_size: int,
         num_layers: int,
         drift_init: float,
-        diffusion_init: float,
+        diffusion_init: float | list[float] | tuple[float, ...] | torch.Tensor,
         drift_scale: float,
         diffusion_scale: float,
         final_tanh: bool,
@@ -366,7 +399,15 @@ class ObservableSDEFunc(nn.Module):
             hidden_size=hidden_size,
             num_layers=num_layers,
             window_size=self.diffusion_window_size,
-            init_value=diffusion_init,
+            init_value=(
+                _general_diffusion_init(
+                    diffusion_init,
+                    data_size=self.data_size,
+                    noise_size=self.noise_size,
+                )
+                if self.noise_type == "general"
+                else diffusion_init
+            ),
             final_tanh=final_tanh,
             output_scale=diffusion_scale,
             positive=self.noise_type == "diagonal",
@@ -498,7 +539,7 @@ class SDEML(nn.Module):
         hidden_size: int = 32,
         num_layers: int = 2,
         drift_init: float = 0.0,
-        diffusion_init: float = 0.1,
+        diffusion_init: float | list[float] | tuple[float, ...] | torch.Tensor = 0.1,
         drift_scale: float = 1.0,
         diffusion_scale: float = 1.0,
         final_tanh: bool = True,

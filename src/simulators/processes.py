@@ -22,6 +22,12 @@ class PathSimulator(Protocol):
         """Return ts with shape (T,) and paths with shape (N, T, D)."""
 
 
+def _seed_offset(seed: Optional[int], offset: int) -> Optional[int]:
+    if seed is None:
+        return None
+    return int(seed) + int(offset)
+
+
 def _validate_simulation_args(*, n_paths: int, n_steps: int, dt: float) -> None:
     if n_paths < 1:
         raise ValueError("n_paths must be >= 1")
@@ -115,6 +121,163 @@ def _prepare_brownian_increments(
 
 
 @dataclass(frozen=True)
+class PerturbedPathSimulator:
+    """Wrap a simulator with additive observation noise and compound Poisson jumps."""
+
+    base: PathSimulator
+    gaussian_variance: float | list[float] | tuple[float, ...] = 0.0
+    gaussian_include_initial: bool = True
+    gaussian_seed: Optional[int] = None
+    jump_intensity: float = 0.0
+    jump_size: float | list[float] | tuple[float, ...] = 1.0
+    jump_seed: Optional[int] = None
+
+    @property
+    def data_size(self) -> int:
+        return int(self.base.data_size)
+
+    def constant_coefficients(self) -> dict[str, torch.Tensor]:
+        if not hasattr(self.base, "constant_coefficients"):
+            return {}
+        return self.base.constant_coefficients()
+
+    @property
+    def has_perturbations(self) -> bool:
+        variance = torch.as_tensor(self.gaussian_variance, dtype=torch.float32)
+        jump_size = torch.as_tensor(self.jump_size, dtype=torch.float32)
+        has_gaussian = bool(torch.any(variance > 0))
+        has_jumps = self.jump_intensity > 0 and bool(torch.any(jump_size != 0))
+        return has_gaussian or has_jumps
+
+    def _add_gaussian_noise(
+        self,
+        paths: torch.Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        variance = _as_1d_tensor(
+            self.gaussian_variance,
+            size=self.data_size,
+            name="gaussian_variance",
+            device=device,
+            dtype=dtype,
+        )
+        if bool(torch.any(variance < 0)):
+            raise ValueError("gaussian_variance entries must be non-negative")
+        if not bool(torch.any(variance > 0)):
+            return paths
+
+        generator = _make_generator(device, self.gaussian_seed)
+        noise = torch.randn(
+            paths.shape,
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        ) * torch.sqrt(variance).view(1, 1, -1)
+        if not self.gaussian_include_initial:
+            noise[:, 0, :] = 0.0
+        return paths + noise
+
+    def _add_poisson_jumps(
+        self,
+        paths: torch.Tensor,
+        *,
+        dt: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        intensity = float(self.jump_intensity)
+        if intensity < 0:
+            raise ValueError("jump_intensity must be non-negative")
+        jump_size = _as_1d_tensor(
+            self.jump_size,
+            size=self.data_size,
+            name="jump_size",
+            device=device,
+            dtype=dtype,
+        )
+        if intensity == 0 or not bool(torch.any(jump_size != 0)):
+            return paths
+
+        generator = _make_generator(device, self.jump_seed)
+        rate = torch.full(
+            (paths.size(0), paths.size(1) - 1, self.data_size),
+            intensity * float(dt),
+            device=device,
+            dtype=dtype,
+        )
+        jump_counts = torch.poisson(rate, generator=generator)
+        jump_increments = jump_counts * jump_size.view(1, 1, -1)
+        jumps = torch.zeros_like(paths)
+        jumps[:, 1:, :] = torch.cumsum(jump_increments, dim=1)
+        return paths + jumps
+
+    def _apply_perturbations(self, paths: torch.Tensor, *, dt: float) -> torch.Tensor:
+        device = paths.device
+        dtype = paths.dtype
+        paths = self._add_gaussian_noise(paths, device=device, dtype=dtype)
+        return self._add_poisson_jumps(paths, dt=dt, device=device, dtype=dtype)
+
+    def simulate(
+        self,
+        *,
+        n_paths: int,
+        n_steps: int,
+        dt: float,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float32,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ts, paths = self.base.simulate(
+            n_paths=n_paths,
+            n_steps=n_steps,
+            dt=dt,
+            device=device,
+            dtype=dtype,
+        )
+        return ts, self._apply_perturbations(paths, dt=dt)
+
+    def simulate_with_brownian(
+        self,
+        *,
+        n_paths: int,
+        n_steps: int,
+        dt: float,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float32,
+        brownian_increments: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not hasattr(self.base, "simulate_with_brownian"):
+            ts, paths = self.base.simulate(
+                n_paths=n_paths,
+                n_steps=n_steps,
+                dt=dt,
+                device=device,
+                dtype=dtype,
+            )
+            increments = _prepare_brownian_increments(
+                brownian_increments,
+                n_paths=n_paths,
+                n_steps=n_steps,
+                dt=dt,
+                noise_size=self.data_size,
+                device=torch.device(device),
+                dtype=dtype,
+                seed=None,
+            )
+        else:
+            ts, paths, increments = self.base.simulate_with_brownian(
+                n_paths=n_paths,
+                n_steps=n_steps,
+                dt=dt,
+                device=device,
+                dtype=dtype,
+                brownian_increments=brownian_increments,
+            )
+        return ts, self._apply_perturbations(paths, dt=dt), increments
+
+
+@dataclass(frozen=True)
 class ArithmeticBrownianMotionSimulator:
     """Exact simulator for dS_i = mu_i dt + sigma_i dW_i."""
 
@@ -136,9 +299,16 @@ class ArithmeticBrownianMotionSimulator:
             mu = mu.expand(self.dim)
         if sigma.numel() == 1:
             sigma = sigma.expand(self.dim)
+        diffusion_matrix = torch.diag(sigma) @ self._correlation_cholesky(
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        diffusion_covariance = diffusion_matrix @ diffusion_matrix.T
         return {
             "drift": mu,
             "diffusion": sigma,
+            "diffusion_matrix": diffusion_matrix,
+            "diffusion_covariance": diffusion_covariance,
         }
 
     def _correlation_cholesky(

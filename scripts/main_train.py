@@ -21,12 +21,14 @@ from src.simulators import (
     DeterministicDriftSimulator,
     MultiDimensionalGBMSimulator,
     OUSimulator,
+    PerturbedPathSimulator,
 )
 from src.train import SDEGANTrainConfig, train_sdegan
 from utils.data import PathDataConfig, make_sdegan_dataset
 from utils.logging import log_config, setup_logger
 from utils.visual import (
     plot_constant_coefficient_history,
+    plot_constant_diffusion_covariance_history,
     plot_epoch_diagnostics,
     plot_real_generated_paths,
 )
@@ -34,6 +36,12 @@ from utils.visual import (
 
 def _to_container(cfg: DictConfig) -> dict[str, Any]:
     return OmegaConf.to_container(cfg, resolve=True)
+
+
+def _plain_config_value(value):
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    return value
 
 
 def _as_float_or_list(value, *, dim: int, name: str) -> float | list[float]:
@@ -62,6 +70,58 @@ def _build_equicorrelation(dim: int, rho: float) -> list[list[float]] | None:
     return [[1.0 if i == j else rho for j in range(dim)] for i in range(dim)]
 
 
+def maybe_add_perturbations(simulator, cfg: DictConfig):
+    perturbations = cfg.simulator.get("perturbations")
+    if perturbations is None:
+        return simulator
+
+    data_size = int(simulator.data_size)
+    gaussian = perturbations.get("gaussian", {})
+    jumps = perturbations.get("jumps", {})
+
+    gaussian_enabled = bool(gaussian.get("enabled", False))
+    jump_enabled = bool(jumps.get("enabled", False))
+
+    gaussian_variance = 0.0
+    gaussian_include_initial = True
+    gaussian_seed = None
+    if gaussian_enabled:
+        gaussian_variance = _as_float_or_list(
+            gaussian.get("variance", 0.0),
+            dim=data_size,
+            name="simulator.perturbations.gaussian.variance",
+        )
+        gaussian_include_initial = bool(gaussian.get("include_initial", True))
+        gaussian_seed = gaussian.get("seed")
+        if gaussian_seed is None:
+            gaussian_seed = int(cfg.seed) + 100_003
+
+    jump_intensity = 0.0
+    jump_size = 1.0
+    jump_seed = None
+    if jump_enabled:
+        jump_intensity = float(jumps.get("intensity", 0.0))
+        jump_size = _as_float_or_list(
+            jumps.get("size", 1.0),
+            dim=data_size,
+            name="simulator.perturbations.jumps.size",
+        )
+        jump_seed = jumps.get("seed")
+        if jump_seed is None:
+            jump_seed = int(cfg.seed) + 200_003
+
+    perturbed = PerturbedPathSimulator(
+        base=simulator,
+        gaussian_variance=gaussian_variance,
+        gaussian_include_initial=gaussian_include_initial,
+        gaussian_seed=None if gaussian_seed is None else int(gaussian_seed),
+        jump_intensity=jump_intensity,
+        jump_size=jump_size,
+        jump_seed=None if jump_seed is None else int(jump_seed),
+    )
+    return perturbed if perturbed.has_perturbations else simulator
+
+
 def resolve_device(device: str) -> torch.device:
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -88,7 +148,7 @@ def build_simulator(cfg: DictConfig):
             corr = _to_container(abm.corr)
         elif dim > 1:
             corr = _build_equicorrelation(dim, float(abm.rho))
-        return ArithmeticBrownianMotionSimulator(
+        simulator = ArithmeticBrownianMotionSimulator(
             s0=_as_float_or_list(abm.s0, dim=dim, name="abm.s0"),
             mu=_as_float_or_list(abm.mu, dim=dim, name="abm.mu"),
             sigma=_as_float_or_list(abm.sigma, dim=dim, name="abm.sigma"),
@@ -96,6 +156,7 @@ def build_simulator(cfg: DictConfig):
             corr=corr,
             seed=int(cfg.seed),
         )
+        return maybe_add_perturbations(simulator, cfg)
 
     if name == "gbm":
         gbm = cfg.simulator.gbm
@@ -105,7 +166,7 @@ def build_simulator(cfg: DictConfig):
             corr = _to_container(gbm.corr)
         elif dim > 1:
             corr = _build_equicorrelation(dim, float(gbm.rho))
-        return MultiDimensionalGBMSimulator(
+        simulator = MultiDimensionalGBMSimulator(
             s0=_as_float_or_list(gbm.s0, dim=dim, name="gbm.s0"),
             mu=_as_float_or_list(gbm.mu, dim=dim, name="gbm.mu"),
             sigma=_as_float_or_list(gbm.sigma, dim=dim, name="gbm.sigma"),
@@ -113,22 +174,25 @@ def build_simulator(cfg: DictConfig):
             corr=corr,
             seed=int(cfg.seed),
         )
+        return maybe_add_perturbations(simulator, cfg)
 
     if name == "deterministic":
         det = cfg.simulator.deterministic
-        return DeterministicDriftSimulator(s0=float(det.s0), mu=float(det.mu))
+        simulator = DeterministicDriftSimulator(s0=float(det.s0), mu=float(det.mu))
+        return maybe_add_perturbations(simulator, cfg)
 
     if name != "ou":
         raise ValueError(f"Unsupported simulator: {name}")
 
     ou = cfg.simulator.ou
-    return OUSimulator(
+    simulator = OUSimulator(
         s0=float(ou.s0),
         theta=float(ou.theta),
         mu=float(ou.mu),
         sigma=float(ou.sigma),
         seed=int(cfg.seed),
     )
+    return maybe_add_perturbations(simulator, cfg)
 
 
 def true_constant_coefficients(simulator) -> dict[str, list[float]]:
@@ -184,6 +248,30 @@ def maybe_save_plots(
             true_value=true_coefficients.get("diffusion"),
             save_path=fig_dir / "constant_diffusion_by_epoch.pdf",
         )
+        if (
+            str(cfg.simulator.name) == "abm"
+            and int(cfg.simulator.abm.dim) > 1
+            and str(cfg.model.generator.diffusion_head) == "constant"
+        ):
+            noise_type = str(cfg.model.generator.noise_type).lower()
+            data_size = int(cfg.simulator.abm.dim)
+            noise_size = data_size if noise_type == "diagonal" else int(cfg.model.generator.noise_size)
+            true_diffusion_target = true_coefficients.get("diffusion_covariance")
+            true_diffusion_target_kind = "covariance"
+            if true_diffusion_target is None:
+                true_diffusion_target = true_coefficients.get("diffusion_matrix")
+                true_diffusion_target_kind = "diffusion"
+            if true_diffusion_target is None:
+                true_diffusion_target = true_coefficients.get("diffusion")
+                true_diffusion_target_kind = "diffusion"
+            plot_constant_diffusion_covariance_history(
+                history,
+                diffusion_shape=(data_size, noise_size),
+                diagonal=noise_type == "diagonal",
+                true_value=true_diffusion_target,
+                true_value_kind=true_diffusion_target_kind,
+                save_path=fig_dir / "constant_diffusion_covariance_by_epoch.pdf",
+            )
 
     n_paths = min(int(cfg.plots.n_paths), real_paths.size(0))
     generator.eval()
@@ -248,8 +336,8 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
         diffusion_window_size=int(cfg.model.generator.diffusion_window_size),
         hidden_size=int(cfg.model.generator.hidden_size),
         num_layers=int(cfg.model.generator.num_layers),
-        drift_init=float(cfg.model.generator.drift_init),
-        diffusion_init=float(cfg.model.generator.diffusion_init),
+        drift_init=_plain_config_value(cfg.model.generator.drift_init),
+        diffusion_init=_plain_config_value(cfg.model.generator.diffusion_init),
         drift_scale=float(cfg.model.generator.drift_scale),
         diffusion_scale=float(cfg.model.generator.diffusion_scale),
         final_tanh=bool(cfg.model.generator.final_tanh),
@@ -264,6 +352,9 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
         method=str(cfg.model.discriminator.method),
         dt=float(cfg.model.discriminator.dt),
         adjoint=bool(cfg.model.discriminator.adjoint),
+        func_final_tanh=bool(cfg.model.discriminator.get("func_final_tanh", False)),
+        initial_final_tanh=bool(cfg.model.discriminator.get("initial_final_tanh", False)),
+        readout_mode=str(cfg.model.discriminator.get("readout_mode", "interval")),
     )
     run_logger.info(
         "Models prepared: generator_params={}, discriminator_params={}",
@@ -280,6 +371,11 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
         discriminator_lr=float(cfg.train.discriminator_lr),
         weight_decay=float(cfg.train.weight_decay),
         optimizer=str(cfg.train.optimizer),
+        adam_beta1=float(cfg.train.get("adam_beta1", 0.9)),
+        adam_beta2=float(cfg.train.get("adam_beta2", 0.999)),
+        scheduler=cfg.train.get("scheduler", "step"),
+        scheduler_step_size=int(cfg.train.get("scheduler_step_size", 800)),
+        scheduler_gamma=float(cfg.train.get("scheduler_gamma", 0.8)),
         n_critic=int(cfg.train.n_critic),
         clip_discriminator=bool(cfg.train.clip_discriminator),
         swa_start_step=cfg.train.swa_start_step,

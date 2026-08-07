@@ -25,17 +25,22 @@ if TYPE_CHECKING:
 
 @dataclass
 class SDEGANTrainConfig:
-    epochs: int = 100
+    epochs: int = 150
     steps: Optional[int] = None
     steps_per_epoch: Optional[int] = None
     batch_size: int = 1024
-    generator_lr: float = 2e-4
-    discriminator_lr: float = 1e-3
-    weight_decay: float = 1e-2
-    optimizer: str = "adadelta"
+    generator_lr: float = 1e-4
+    discriminator_lr: float = 1e-1
+    weight_decay: float = 0.0
+    optimizer: str = "adam"
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    scheduler: Optional[str] = "step"
+    scheduler_step_size: int = 800
+    scheduler_gamma: float = 0.8
     n_critic: int = 1
     clip_discriminator: bool = True
-    swa_start_step: Optional[int] = 5_000
+    swa_start_step: Optional[int] = None
     log_every: int = 10
     eval_every: int = 0
     metrics_every_epoch: int = 1
@@ -128,7 +133,49 @@ def _make_optimizer(
         return torch.optim.Adadelta(parameters, lr=lr, weight_decay=weight_decay)
     if name == "adam":
         return torch.optim.Adam(parameters, lr=lr, betas=adam_betas, weight_decay=weight_decay)
+    if name == "rmsprop":
+        return torch.optim.RMSprop(parameters, lr=lr, weight_decay=weight_decay)
     raise ValueError(f"Unsupported optimizer: {name}")
+
+
+def _make_scheduler(
+    name: Optional[str],
+    optimizer: Optimizer,
+    *,
+    step_size: int,
+    gamma: float,
+):
+    if name is None:
+        return None
+    value = name.lower()
+    if value in {"none", "null", ""}:
+        return None
+    if value == "step":
+        if step_size < 1:
+            raise ValueError("scheduler_step_size must be >= 1")
+        return torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=int(step_size),
+            gamma=float(gamma),
+        )
+    raise ValueError(f"Unsupported scheduler: {name}")
+
+
+def _current_lr(optimizer: Optimizer) -> float:
+    return float(optimizer.param_groups[0]["lr"])
+
+
+def _gradient_log_norm(*models: nn.Module) -> float:
+    total: Optional[torch.Tensor] = None
+    for model in models:
+        for param in model.parameters():
+            if param.grad is None or not param.requires_grad:
+                continue
+            value = torch.mean(param.grad.detach() ** 2, dim=0).sum()
+            total = value if total is None else total + value
+    if total is None:
+        return float("nan")
+    return float((0.5 * torch.log(total.clamp_min(1e-30))).detach().cpu().item())
 
 
 def _normalize_sde_ml_likelihood_backend(backend: str) -> str:
@@ -424,6 +471,10 @@ def train_sdegan(
         raise ValueError("steps_per_epoch must be >= 1 when provided")
     if config.n_critic < 1:
         raise ValueError("n_critic must be >= 1")
+    if not (0.0 <= config.adam_beta1 < 1.0):
+        raise ValueError("adam_beta1 must be in [0, 1)")
+    if not (0.0 <= config.adam_beta2 < 1.0):
+        raise ValueError("adam_beta2 must be in [0, 1)")
     if hasattr(dataloader, "__len__") and len(dataloader) == 0:
         raise ValueError(
             "dataloader is empty; lower batch_size or disable drop_last for small datasets."
@@ -444,12 +495,26 @@ def train_sdegan(
         generator.parameters(),
         lr=config.generator_lr,
         weight_decay=config.weight_decay,
+        adam_betas=(config.adam_beta1, config.adam_beta2),
     )
     discriminator_optimizer = _make_optimizer(
         config.optimizer,
         discriminator.parameters(),
         lr=config.discriminator_lr,
         weight_decay=config.weight_decay,
+        adam_betas=(config.adam_beta1, config.adam_beta2),
+    )
+    generator_scheduler = _make_scheduler(
+        config.scheduler,
+        generator_optimizer,
+        step_size=config.scheduler_step_size,
+        gamma=config.scheduler_gamma,
+    )
+    discriminator_scheduler = _make_scheduler(
+        config.scheduler,
+        discriminator_optimizer,
+        step_size=config.scheduler_step_size,
+        gamma=config.scheduler_gamma,
     )
 
     averaged_generator = AveragedModel(generator)
@@ -459,6 +524,13 @@ def train_sdegan(
     total_epochs = (total_steps + steps_per_epoch - 1) // steps_per_epoch
     use_swa = config.swa_start_step is not None and config.swa_start_step < total_steps
     swa_updates = 0
+    if config.steps is None and config.steps_per_epoch is None and hasattr(logger, "warning"):
+        logger.warning(
+            "SDEGAN steps_per_epoch is inferred from len(dataloader)={}. "
+            "Changing dataset_size with a fixed batch_size changes the number of optimizer updates. "
+            "Set train.steps or train.steps_per_epoch explicitly for comparable runs.",
+            len(dataloader),
+        )
 
     history: dict[str, list[float]] = {
         "loss_d": [],
@@ -469,6 +541,9 @@ def train_sdegan(
         "critic_fake": [],
         "critic_real_epoch": [],
         "critic_fake_epoch": [],
+        "lr_generator": [],
+        "lr_discriminator": [],
+        "grad_norm": [],
         "eval_loss": [],
         "eval_epoch": [],
         "epoch": [],
@@ -484,12 +559,17 @@ def train_sdegan(
 
     batches = _cycle(dataloader)
     logger.info(
-        "SDEGAN training started: epochs={}, steps={}, steps_per_epoch={}, batch_size={}, optimizer={}, n_critic={}, device={}",
+        "SDEGAN training started: epochs={}, steps={}, steps_per_epoch={}, batch_size={}, optimizer={}, adam_betas=({}, {}), scheduler={}, scheduler_step_size={}, scheduler_gamma={}, discriminator_steps={}, device={}",
         total_epochs,
         total_steps,
         steps_per_epoch,
         config.batch_size,
         config.optimizer,
+        config.adam_beta1,
+        config.adam_beta2,
+        config.scheduler,
+        config.scheduler_step_size,
+        config.scheduler_gamma,
         config.n_critic,
         device,
     )
@@ -501,41 +581,59 @@ def train_sdegan(
 
     for step in range(1, total_steps + 1):
         epoch = (step - 1) // steps_per_epoch + 1
-        real, y0 = _unpack_sdegan_batch(next(batches), device=device)
-        batch_size = real.size(0)
+        loss_d = None
+        real_score_mean = None
+        fake_score_mean = None
+        batch_size = 0
 
+        generator.train()
         discriminator.train()
-        generator.eval()
-        discriminator_optimizer.zero_grad(set_to_none=True)
-        with torch.no_grad():
+        for _ in range(config.n_critic):
+            real, y0 = _unpack_sdegan_batch(next(batches), device=device)
+            batch_size = real.size(0)
+            generator_optimizer.zero_grad(set_to_none=True)
+            discriminator_optimizer.zero_grad(set_to_none=True)
+
             fake = generator(ts, y0)
-        real_score = discriminator(real)
-        fake_score = discriminator(fake)
-        loss_d = fake_score.mean() - real_score.mean()
-        loss_d.backward()
-        discriminator_optimizer.step()
+            real_score_mean = discriminator(real).mean()
+            fake_score_mean = discriminator(fake).mean()
+            loss_d = fake_score_mean - real_score_mean
+            loss_d.backward()
+            discriminator_optimizer.step()
+
+        if loss_d is None or real_score_mean is None or fake_score_mean is None:
+            raise RuntimeError("No SDEGAN discriminator step was executed.")
+
+        for param in generator.parameters():
+            if param.grad is not None:
+                param.grad.mul_(-1.0)
+
+        generator_optimizer.step()
+
+        if generator_scheduler is not None:
+            generator_scheduler.step()
+        if discriminator_scheduler is not None:
+            discriminator_scheduler.step()
+
         if config.clip_discriminator:
             clip_linear_weights(discriminator)
 
+        loss_g_value = float((-fake_score_mean).detach().item())
+        grad_norm = _gradient_log_norm(generator, discriminator)
+        lr_generator = _current_lr(generator_optimizer)
+        lr_discriminator = _current_lr(discriminator_optimizer)
+
         history["loss_d"].append(float(loss_d.detach().item()))
-        history["critic_real"].append(float(real_score.mean().detach().item()))
-        history["critic_fake"].append(float(fake_score.mean().detach().item()))
+        history["loss_g"].append(loss_g_value)
+        history["critic_real"].append(float(real_score_mean.detach().item()))
+        history["critic_fake"].append(float(fake_score_mean.detach().item()))
+        history["lr_generator"].append(lr_generator)
+        history["lr_discriminator"].append(lr_discriminator)
+        history["grad_norm"].append(grad_norm)
         epoch_loss_d.append(history["loss_d"][-1])
+        epoch_loss_g.append(loss_g_value)
         epoch_real_score.append(history["critic_real"][-1])
         epoch_fake_score.append(history["critic_fake"][-1])
-
-        loss_g_value = history["loss_g"][-1] if history["loss_g"] else float("nan")
-        if step % config.n_critic == 0:
-            generator.train()
-            discriminator.eval()
-            generator_optimizer.zero_grad(set_to_none=True)
-            fake = generator(ts, y0)
-            loss_g = -discriminator(fake).mean()
-            loss_g.backward()
-            generator_optimizer.step()
-            loss_g_value = float(loss_g.detach().item())
-            history["loss_g"].append(loss_g_value)
-            epoch_loss_g.append(loss_g_value)
 
         if use_swa and step > int(config.swa_start_step):
             averaged_generator.update_parameters(generator)
@@ -564,7 +662,7 @@ def train_sdegan(
         if should_log:
             if eval_loss is None:
                 logger.info(
-                    "epoch={}/{} step={}/{} loss_d={:.6f} loss_g={:.6f} d_real={:.6f} d_fake={:.6f}",
+                    "epoch={}/{} step={}/{} loss_d={:.6f} loss_g={:.6f} d_real={:.6f} d_fake={:.6f} lr_g={:.6g} lr_d={:.6g} grad_log_norm={:.6f}",
                     epoch,
                     total_epochs,
                     step,
@@ -573,10 +671,13 @@ def train_sdegan(
                     loss_g_value,
                     history["critic_real"][-1],
                     history["critic_fake"][-1],
+                    history["lr_generator"][-1],
+                    history["lr_discriminator"][-1],
+                    history["grad_norm"][-1],
                 )
             else:
                 logger.info(
-                    "epoch={}/{} step={}/{} loss_d={:.6f} loss_g={:.6f} eval_loss={:.6f} d_real={:.6f} d_fake={:.6f}",
+                    "epoch={}/{} step={}/{} loss_d={:.6f} loss_g={:.6f} eval_loss={:.6f} d_real={:.6f} d_fake={:.6f} lr_g={:.6g} lr_d={:.6g} grad_log_norm={:.6f}",
                     epoch,
                     total_epochs,
                     step,
@@ -586,6 +687,9 @@ def train_sdegan(
                     eval_loss,
                     history["critic_real"][-1],
                     history["critic_fake"][-1],
+                    history["lr_generator"][-1],
+                    history["lr_discriminator"][-1],
+                    history["grad_norm"][-1],
                 )
 
         if is_epoch_end:
@@ -654,6 +758,12 @@ def train_sdegan(
                 "discriminator_state_dict": discriminator.state_dict(),
                 "generator_optimizer_state_dict": generator_optimizer.state_dict(),
                 "discriminator_optimizer_state_dict": discriminator_optimizer.state_dict(),
+                "generator_scheduler_state_dict": (
+                    None if generator_scheduler is None else generator_scheduler.state_dict()
+                ),
+                "discriminator_scheduler_state_dict": (
+                    None if discriminator_scheduler is None else discriminator_scheduler.state_dict()
+                ),
                 "history": history,
                 "train_config": config.__dict__,
                 "ts": ts.detach().cpu(),

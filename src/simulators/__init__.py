@@ -5,6 +5,7 @@ from src.simulators.processes import (
     MultiDimensionalGBMSimulator,
     OUSimulator,
     PathSimulator,
+    PerturbedPathSimulator,
     sample_brownian_increments,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "MultiDimensionalGBMSimulator",
     "OUSimulator",
     "PathSimulator",
+    "PerturbedPathSimulator",
     "sample_brownian_increments",
 ]
