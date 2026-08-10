@@ -1,4 +1,4 @@
-run_name: sde_ml_mabm_constant_jumps
+run_name: sde_ml_mabm_simple_jumps
 seed: 0
 device: auto
 
@@ -54,8 +54,8 @@ model:
   noise_size: 2
   noise_type: general
   sde_type: ito
-  drift_head: constant
-  diffusion_head: constant
+  drift_head: simple
+  diffusion_head: simple
   drift_window_size: 1
   diffusion_window_size: 1
   hidden_size: 8
@@ -111,6 +111,11 @@ plots:
   enabled: true
   n_paths: 24
   align_initial: true
+  simple_slices:
+    enabled: true
+    n_grid: 128
+    n_levels: 5
+    state_dimension: 0
 
 hydra:
   run:

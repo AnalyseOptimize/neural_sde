@@ -32,6 +32,8 @@ from utils.visual import (
     plot_constant_diffusion_covariance_history,
     plot_epoch_diagnostics,
     plot_real_generated_paths,
+    plot_simple_coefficient_slices,
+    simple_coefficient_components,
 )
 
 
@@ -200,6 +202,53 @@ def true_constant_coefficients(simulator) -> dict[str, list[float]]:
     }
 
 
+def _component_suffix(component, *, n_components: int) -> str:
+    if n_components == 1:
+        return ""
+    if isinstance(component, tuple):
+        return f"_{component[0] + 1}_{component[1] + 1}"
+    return f"_{int(component) + 1}"
+
+
+def maybe_plot_simple_head_slices(
+    *,
+    cfg: DictConfig,
+    fig_dir: Path,
+    model: SDEML,
+    ts: torch.Tensor,
+    real_paths: torch.Tensor,
+) -> None:
+    simple_cfg = cfg.plots.get("simple_slices", {})
+    if not bool(simple_cfg.get("enabled", True)):
+        return
+
+    n_grid = int(simple_cfg.get("n_grid", 128))
+    n_levels = int(simple_cfg.get("n_levels", 5))
+    state_dimension = int(simple_cfg.get("state_dimension", 0))
+    head_types = {
+        "drift": str(cfg.model.drift_head).lower(),
+        "diffusion": str(cfg.model.diffusion_head).lower(),
+    }
+
+    for coefficient, head_type in head_types.items():
+        if head_type != "simple":
+            continue
+        components = simple_coefficient_components(model, coefficient)
+        for component in components:
+            suffix = _component_suffix(component, n_components=len(components))
+            plot_simple_coefficient_slices(
+                model,
+                ts,
+                real_paths,
+                coefficient=coefficient,
+                component=component,
+                state_dimension=state_dimension,
+                n_grid=n_grid,
+                n_levels=n_levels,
+                save_path=fig_dir / f"simple_{coefficient}_slices{suffix}.pdf",
+            )
+
+
 def make_path_dataloader(
     *,
     simulator,
@@ -336,6 +385,14 @@ def maybe_save_plots(
                 true_value_kind=true_diffusion_target_kind,
                 save_path=fig_dir / "constant_diffusion_covariance_by_epoch.pdf",
             )
+
+    maybe_plot_simple_head_slices(
+        cfg=cfg,
+        fig_dir=fig_dir,
+        model=model,
+        ts=ts,
+        real_paths=real_paths,
+    )
 
     n_paths = min(int(cfg.plots.n_paths), real_paths.size(0))
     sampling_backend = str(cfg.train.get("sampling_backend", cfg.model.get("sampling_backend", "torchsde")))

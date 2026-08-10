@@ -655,6 +655,231 @@ def plot_constant_diffusion_covariance_history(
     return _save_or_return(fig, save_path)
 
 
+def _parameter_device_dtype(model) -> tuple[torch.device, torch.dtype]:
+    parameter = next(iter(model.parameters()), None)
+    if parameter is None:
+        return torch.device("cpu"), torch.float32
+    return parameter.device, parameter.dtype
+
+
+def _state_slice_range(real_paths: np.ndarray, state_dimension: int) -> tuple[float, float]:
+    values = real_paths[..., state_dimension].reshape(-1)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return -1.0, 1.0
+
+    low, high = np.quantile(values, [0.02, 0.98])
+    if not np.isfinite(low) or not np.isfinite(high):
+        return -1.0, 1.0
+    if high <= low + 1e-12:
+        center = float(0.5 * (low + high))
+        radius = max(0.5, 0.2 * abs(center))
+        return center - radius, center + radius
+    padding = 0.05 * (high - low)
+    return float(low - padding), float(high + padding)
+
+
+def _baseline_state(real_paths: np.ndarray) -> np.ndarray:
+    flat = real_paths.reshape(-1, real_paths.shape[-1])
+    baseline = np.nanmedian(flat, axis=0)
+    baseline = np.where(np.isfinite(baseline), baseline, 0.0)
+    return baseline.astype(float, copy=False)
+
+
+def _select_coefficient_component(
+    values: torch.Tensor,
+    *,
+    coefficient: Literal["drift", "diffusion"],
+    component: int | tuple[int, int],
+) -> torch.Tensor:
+    if coefficient == "drift":
+        if values.ndim != 2:
+            raise ValueError(f"drift values must have shape (B, D), got {tuple(values.shape)}")
+        if isinstance(component, tuple):
+            component = component[0]
+        return values[:, int(component)]
+
+    if values.ndim == 2:
+        if isinstance(component, tuple):
+            component = component[0]
+        return values[:, int(component)]
+    if values.ndim == 3:
+        if isinstance(component, tuple):
+            row, col = component
+        else:
+            row = int(component) // values.size(2)
+            col = int(component) % values.size(2)
+        return values[:, int(row), int(col)]
+    raise ValueError(f"diffusion values must have shape (B, D) or (B, D, M), got {tuple(values.shape)}")
+
+
+def _evaluate_coefficient_component(
+    model,
+    coefficient: Literal["drift", "diffusion"],
+    *,
+    t: torch.Tensor,
+    states: torch.Tensor,
+    component: int | tuple[int, int],
+) -> torch.Tensor:
+    func = getattr(model, "func", None)
+    if func is None:
+        raise ValueError("model must expose a .func object with SDE coefficients")
+
+    drift, diffusion = func.f_and_g(t, states)
+    values = drift if coefficient == "drift" else diffusion
+    return _select_coefficient_component(values, coefficient=coefficient, component=component)
+
+
+def _component_label(
+    *,
+    coefficient: Literal["drift", "diffusion"],
+    component: int | tuple[int, int],
+) -> str:
+    if coefficient == "drift":
+        if isinstance(component, tuple):
+            component = component[0]
+        return rf"$\mu_{{{int(component) + 1}}}$"
+    if isinstance(component, tuple):
+        row, col = component
+    else:
+        row, col = int(component), None
+    if col is None:
+        return rf"$\sigma_{{{row + 1}}}$"
+    return rf"$\sigma_{{{row + 1},{col + 1}}}$"
+
+
+def plot_simple_coefficient_slices(
+    model,
+    ts,
+    real_paths,
+    *,
+    coefficient: Literal["drift", "diffusion"],
+    component: int | tuple[int, int] = 0,
+    state_dimension: int = 0,
+    n_grid: int = 128,
+    n_levels: int = 5,
+    save_path: str | Path | None = None,
+):
+    """
+    Plot one-dimensional slices of a simple coefficient head.
+
+    The left panel shows coefficient(t, S) as a function of t for several fixed
+    state levels. The right panel shows coefficient(t, S) as a function of S for
+    several fixed time levels.
+    """
+
+    if coefficient not in {"drift", "diffusion"}:
+        raise ValueError("coefficient must be one of: drift, diffusion")
+    if n_grid < 2:
+        raise ValueError("n_grid must be >= 2")
+    if n_levels < 1:
+        raise ValueError("n_levels must be >= 1")
+
+    paths = _as_paths(real_paths, name="real_paths")
+    if state_dimension < 0 or state_dimension >= paths.shape[-1]:
+        raise ValueError(
+            f"state_dimension must be in [0, {paths.shape[-1] - 1}], got {state_dimension}"
+        )
+    ts_np = _as_ts(ts, expected_steps=paths.shape[1])
+    t_grid_np = np.linspace(float(ts_np[0]), float(ts_np[-1]), int(n_grid))
+    state_low, state_high = _state_slice_range(paths, int(state_dimension))
+    state_grid_np = np.linspace(state_low, state_high, int(n_grid))
+    state_levels_np = np.linspace(state_low, state_high, int(n_levels))
+    time_levels_np = np.linspace(float(ts_np[0]), float(ts_np[-1]), int(n_levels))
+    baseline_np = _baseline_state(paths)
+
+    device, dtype = _parameter_device_dtype(model)
+    baseline = torch.as_tensor(baseline_np, device=device, dtype=dtype)
+    t_grid = torch.as_tensor(t_grid_np, device=device, dtype=dtype)
+    state_grid = torch.as_tensor(state_grid_np, device=device, dtype=dtype)
+
+    time_slices = []
+    state_slices = []
+    model.eval()
+    with torch.no_grad():
+        for state_value in state_levels_np:
+            states = baseline.view(1, -1).expand(t_grid.numel(), -1).clone()
+            states[:, int(state_dimension)] = float(state_value)
+            values = []
+            for idx in range(t_grid.numel()):
+                value = _evaluate_coefficient_component(
+                    model,
+                    coefficient,
+                    t=t_grid[idx],
+                    states=states[idx : idx + 1],
+                    component=component,
+                )
+                values.append(value.squeeze(0))
+            time_slices.append(torch.stack(values).detach().cpu().numpy())
+
+        for time_value in time_levels_np:
+            states = baseline.view(1, -1).expand(state_grid.numel(), -1).clone()
+            states[:, int(state_dimension)] = state_grid
+            values = _evaluate_coefficient_component(
+                model,
+                coefficient,
+                t=torch.as_tensor(float(time_value), device=device, dtype=dtype),
+                states=states,
+                component=component,
+            )
+            state_slices.append(values.detach().cpu().numpy())
+
+    with _scientific_style():
+        fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.2), squeeze=False)
+        ax_t, ax_s = axes[0]
+        colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        pretty = "Drift" if coefficient == "drift" else "Diffusion"
+        component_text = _component_label(coefficient=coefficient, component=component)
+
+        for idx, values in enumerate(time_slices):
+            color = colors[idx % len(colors)]
+            ax_t.plot(
+                t_grid_np,
+                values,
+                color=color,
+                label=rf"$S_t={state_levels_np[idx]:.3g}$",
+            )
+        ax_t.set_xlabel("Time")
+        ax_t.set_ylabel(f"{pretty} coefficient")
+        ax_t.set_title(rf"{component_text} as a function of $t$")
+        _format_axes(ax_t)
+        ax_t.legend(frameon=False, loc="best")
+
+        for idx, values in enumerate(state_slices):
+            color = colors[idx % len(colors)]
+            ax_s.plot(
+                state_grid_np,
+                values,
+                color=color,
+                label=rf"$t={time_levels_np[idx]:.3g}$",
+            )
+        ax_s.set_xlabel(r"$S_t$")
+        ax_s.set_ylabel(f"{pretty} coefficient")
+        ax_s.set_title(rf"{component_text} as a function of $S_t$")
+        _format_axes(ax_s)
+        ax_s.legend(frameon=False, loc="best")
+
+        fig.tight_layout()
+    return _save_or_return(fig, save_path)
+
+
+def simple_coefficient_components(model, coefficient: Literal["drift", "diffusion"]) -> list[int | tuple[int, int]]:
+    """Return component identifiers for plotting simple coefficient heads."""
+
+    if coefficient not in {"drift", "diffusion"}:
+        raise ValueError("coefficient must be one of: drift, diffusion")
+
+    data_size = int(getattr(model, "data_size"))
+    if coefficient == "drift":
+        return list(range(data_size))
+
+    noise_type = str(getattr(model, "noise_type", "diagonal")).lower()
+    if noise_type == "general":
+        noise_size = int(getattr(model, "noise_size"))
+        return [(row, col) for row in range(data_size) for col in range(noise_size)]
+    return list(range(data_size))
+
+
 def plot_loss_history(history: dict, *, save_path: str | Path | None = None):
     return plot_epoch_diagnostics(history, option="loss", save_path=save_path)
 

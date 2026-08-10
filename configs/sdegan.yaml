@@ -114,6 +114,11 @@ plots:
   enabled: true
   n_paths: 24
   align_initial: true
+  simple_slices:
+    enabled: true
+    n_grid: 128
+    n_levels: 5
+    state_dimension: 0
 
 hydra:
   run:
