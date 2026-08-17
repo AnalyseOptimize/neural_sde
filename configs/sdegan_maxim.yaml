@@ -1,4 +1,4 @@
-run_name: sdegan_abm_constant
+run_name: sdegan_maxim_abm_contant
 seed: 0
 device: auto
 
@@ -17,11 +17,11 @@ data:
 simulator:
   name: abm
   abm:
-    dim: 2
+    dim: 1
     s0: 0.0
     mu: 0.1
     sigma: 0.2
-    rho: 0.5
+    rho: 0.0
     corr: null
   gbm:
     dim: 1
@@ -52,34 +52,35 @@ simulator:
 
 model:
   generator:
-    noise_size: 2
+    hidden_size: 16
+    noise_size: 3
     noise_type: general
+    mlp_size: 16
+    num_layers: 1
     drift_head: constant
     diffusion_head: constant
     drift_window_size: 1
     diffusion_window_size: 1
-    hidden_size: 16
-    num_layers: 1
     drift_init: 0.0
     diffusion_init: 0.1
-    drift_scale: 1.0
-    diffusion_scale: 1.0
-    final_tanh: false
+    coefficient_tanh: false
+    readout_bias: false
+    fusion_num_layers: 2
+    fusion_last_bias: false
     method: reversible_heun
     dt: null
   discriminator:
     hidden_size: 16
     mlp_size: 16
     num_layers: 1
+    func_tanh: true
+    initial_tanh: false
     method: reversible_heun
-    dt: 0.1
+    dt: 1.0
     adjoint: true
-    func_final_tanh: false
-    initial_final_tanh: false
-    readout_mode: interval
 
 train:
-  epochs: 300
+  epochs: 150
   steps: null
   steps_per_epoch: null
   batch_size: 1024
@@ -94,11 +95,8 @@ train:
   scheduler_gamma: 0.8
   n_critic: 1
   clip_discriminator: true
-  swa_start_step: null
   log_every: 10
   eval_every: 0
-  init_mult_initial: 1.0
-  init_mult_func: 1.0
   save_checkpoint: true
 
 evaluation:
@@ -107,8 +105,7 @@ evaluation:
   n_paths: 512
   num_quantiles: 1024
   align_initial: true
-  coupled_brownian: true
-  brownian_seed: 0
+  coupled_brownian: false
 
 plots:
   enabled: true
@@ -118,7 +115,7 @@ plots:
     enabled: true
     n_grid: 128
     n_levels: 5
-    state_dimension: 0
+    hidden_dimension: 0
 
 hydra:
   run:

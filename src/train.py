@@ -19,6 +19,8 @@ from src.metrics import compute_path_metrics
 from src.simulators import sample_brownian_increments
 
 if TYPE_CHECKING:
+    from src.nets.latent_sde import ConditionalLatentSDE
+    from src.nets.sde_matching import SDEMatching
     from src.nets.sde_ml import SDEML
     from src.nets.sdegan import CDEDiscriminator, SDEGenerator
 
@@ -79,6 +81,65 @@ class SDEMLTrainConfig:
     include_initial_likelihood: bool = False
     initial_std: Optional[float] = None
     checkpoint_path: Optional[str] = None
+
+
+@dataclass
+class LatentSDETrainConfig:
+    epochs: int = 150
+    steps: Optional[int] = None
+    steps_per_epoch: Optional[int] = None
+    batch_size: int = 1024
+    lr: float = 1e-2
+    lr_gamma: float = 0.997
+    weight_decay: float = 0.0
+    kl_anneal_iters: int = 1000
+    noise_std: float = 0.01
+    adjoint: bool = False
+    method: str = "euler"
+    dt: float = 1e-2
+    sample_method: Optional[str] = None
+    sample_dt: float = 1e-3
+    grad_clip_norm: Optional[float] = None
+    log_every: int = 10
+    eval_every: int = 0
+    metrics_every_epoch: int = 1
+    metrics_n_paths: int = 512
+    metrics_num_quantiles: int = 1024
+    metrics_align_initial: bool = True
+    checkpoint_path: Optional[str] = None
+
+
+@dataclass
+class SDEMatchingTrainConfig:
+    epochs: int = 40
+    steps: Optional[int] = 4000
+    steps_per_epoch: Optional[int] = 100
+    batch_size: int = 1024
+    lr: float = 1e-3
+    weight_decay: float = 0.0
+    grad_clip_norm: Optional[float] = None
+    log_every: int = 10
+    eval_every: int = 0
+    sample_inner_steps: int = 1
+    metrics_every_epoch: int = 1
+    metrics_n_paths: int = 512
+    metrics_num_quantiles: int = 1024
+    metrics_align_initial: bool = True
+    checkpoint_path: Optional[str] = None
+
+
+class LinearScheduler:
+    def __init__(self, iters: int, maxval: float = 1.0) -> None:
+        self._iters = max(1, int(iters))
+        self._val = float(maxval) / self._iters
+        self._maxval = float(maxval)
+
+    def step(self) -> None:
+        self._val = min(self._maxval, self._val + self._maxval / self._iters)
+
+    @property
+    def val(self) -> float:
+        return self._val
 
 
 def _cycle(loader: Iterable):
@@ -773,6 +834,621 @@ def train_sdegan(
         logger.info("Checkpoint saved: {}", checkpoint_path)
 
     logger.info("SDEGAN training finished")
+    return history
+
+
+@torch.no_grad()
+def evaluate_latent_sde_loss(
+    model: "ConditionalLatentSDE",
+    dataloader: DataLoader,
+    ts: torch.Tensor,
+    *,
+    device: torch.device | str,
+    noise_std: float,
+    adjoint: bool = False,
+    method: str = "euler",
+    dt: float = 1e-2,
+    max_batches: Optional[int] = None,
+) -> float:
+    model.eval()
+    device = torch.device(device)
+    ts = ts.to(device)
+
+    total_loss = 0.0
+    total_size = 0
+    for batch_idx, batch in enumerate(dataloader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+        paths = _unpack_path_batch(batch, device=device).to(dtype=ts.dtype)
+        log_pxs, kl = model(
+            paths,
+            ts,
+            noise_std=noise_std,
+            adjoint=adjoint,
+            method=method,
+            dt=dt,
+        )
+        loss = -log_pxs + kl
+        total_loss += float(loss.item()) * paths.size(0)
+        total_size += paths.size(0)
+
+    if total_size == 0:
+        raise ValueError("Cannot evaluate on an empty dataloader.")
+    return total_loss / total_size
+
+
+@torch.no_grad()
+def evaluate_latent_sde_path_metrics(
+    model: "ConditionalLatentSDE",
+    real_paths: torch.Tensor,
+    ts: torch.Tensor,
+    *,
+    n_paths: int,
+    num_quantiles: int,
+    align_initial: bool,
+    device: torch.device | str,
+    sample_method: Optional[str] = None,
+    sample_dt: float = 1e-3,
+) -> dict[str, torch.Tensor]:
+    model.eval()
+    device = torch.device(device)
+    ts = ts.to(device)
+    n_paths = min(int(n_paths), real_paths.size(0))
+    if n_paths < 1:
+        raise ValueError("n_paths must be >= 1")
+
+    real = real_paths[:n_paths].to(device=device, dtype=ts.dtype)
+    generated = model.sample_paths(
+        ts,
+        real[:, 0, :],
+        method=sample_method,
+        dt=sample_dt,
+    )
+    if align_initial:
+        generated = generated - generated[:, :1, :] + real[:, :1, :]
+    return compute_path_metrics(
+        real,
+        generated,
+        num_quantiles=num_quantiles,
+    )
+
+
+def train_latent_sde(
+    *,
+    model: "ConditionalLatentSDE",
+    dataloader: DataLoader,
+    ts: torch.Tensor,
+    device: torch.device | str,
+    logger,
+    config: Optional[LatentSDETrainConfig] = None,
+    metric_real_paths: Optional[torch.Tensor] = None,
+) -> dict[str, list[float]]:
+    config = LatentSDETrainConfig() if config is None else config
+    if config.epochs < 1:
+        raise ValueError("epochs must be >= 1")
+    if config.steps is not None and config.steps < 1:
+        raise ValueError("steps must be >= 1 when provided")
+    if config.steps_per_epoch is not None and config.steps_per_epoch < 1:
+        raise ValueError("steps_per_epoch must be >= 1 when provided")
+    if config.kl_anneal_iters < 1:
+        raise ValueError("kl_anneal_iters must be >= 1")
+    if config.noise_std <= 0:
+        raise ValueError("noise_std must be positive")
+    if config.dt <= 0:
+        raise ValueError("dt must be positive")
+    if config.sample_dt <= 0:
+        raise ValueError("sample_dt must be positive")
+    if config.grad_clip_norm is not None and config.grad_clip_norm <= 0:
+        raise ValueError("grad_clip_norm must be positive when provided")
+    if hasattr(dataloader, "__len__") and len(dataloader) == 0:
+        raise ValueError(
+            "dataloader is empty; lower batch_size or disable drop_last for small datasets."
+        )
+
+    device = torch.device(device)
+    ts = ts.to(device)
+    model = model.to(device)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=optimizer, gamma=config.lr_gamma)
+    kl_scheduler = LinearScheduler(iters=config.kl_anneal_iters)
+
+    steps_per_epoch = config.steps_per_epoch or len(dataloader)
+    total_steps = config.steps or (config.epochs * steps_per_epoch)
+    total_epochs = (total_steps + steps_per_epoch - 1) // steps_per_epoch
+    if config.steps is None and config.steps_per_epoch is None and hasattr(logger, "warning"):
+        logger.warning(
+            "Latent SDE steps_per_epoch is inferred from len(dataloader)={}. "
+            "Changing dataset_size with a fixed batch_size changes the number of optimizer updates. "
+            "Set train.steps or train.steps_per_epoch explicitly for comparable runs.",
+            len(dataloader),
+        )
+
+    history: dict[str, list[float]] = {
+        "loss": [],
+        "loss_epoch": [],
+        "log_pxs": [],
+        "log_pxs_epoch": [],
+        "kl": [],
+        "kl_epoch": [],
+        "kl_coeff": [],
+        "lr": [],
+        "grad_norm": [],
+        "eval_loss": [],
+        "eval_epoch": [],
+        "epoch": [],
+        "metrics_epoch": [],
+        "expected_supremum_squared_error": [],
+        "marginal_w1_max": [],
+        "marginal_w1_average": [],
+    }
+
+    batches = _cycle(dataloader)
+    logger.info(
+        "Latent SDE training started: epochs={}, steps={}, steps_per_epoch={}, batch_size={}, lr={}, lr_gamma={}, kl_anneal_iters={}, noise_std={}, adjoint={}, method={}, dt={}, sample_method={}, sample_dt={}, device={}",
+        total_epochs,
+        total_steps,
+        steps_per_epoch,
+        config.batch_size,
+        config.lr,
+        config.lr_gamma,
+        config.kl_anneal_iters,
+        config.noise_std,
+        config.adjoint,
+        config.method,
+        config.dt,
+        config.sample_method,
+        config.sample_dt,
+        device,
+    )
+
+    epoch_losses: list[float] = []
+    epoch_log_pxs: list[float] = []
+    epoch_kls: list[float] = []
+    for step in range(1, total_steps + 1):
+        epoch = (step - 1) // steps_per_epoch + 1
+        paths = _unpack_path_batch(next(batches), device=device).to(dtype=ts.dtype)
+
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        log_pxs, kl = model(
+            paths,
+            ts,
+            noise_std=config.noise_std,
+            adjoint=config.adjoint,
+            method=config.method,
+            dt=config.dt,
+        )
+        loss = -log_pxs + kl * kl_scheduler.val
+        loss.backward()
+        if config.grad_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
+        optimizer.step()
+        scheduler.step()
+        kl_scheduler.step()
+
+        loss_value = float(loss.detach().item())
+        log_pxs_value = float(log_pxs.detach().item())
+        kl_value = float(kl.detach().item())
+        grad_norm = _gradient_log_norm(model)
+        history["loss"].append(loss_value)
+        history["log_pxs"].append(log_pxs_value)
+        history["kl"].append(kl_value)
+        history["kl_coeff"].append(float(kl_scheduler.val))
+        history["lr"].append(_current_lr(optimizer))
+        history["grad_norm"].append(grad_norm)
+        epoch_losses.append(loss_value)
+        epoch_log_pxs.append(log_pxs_value)
+        epoch_kls.append(kl_value)
+
+        is_epoch_end = step % steps_per_epoch == 0 or step == total_steps
+        should_log = step == 1 or step % config.log_every == 0 or is_epoch_end
+        should_eval = config.eval_every > 0 and (
+            step % config.eval_every == 0 or step == total_steps
+        )
+        if should_eval:
+            eval_loss = evaluate_latent_sde_loss(
+                model,
+                dataloader,
+                ts,
+                device=device,
+                noise_std=config.noise_std,
+                adjoint=config.adjoint,
+                method=config.method,
+                dt=config.dt,
+                max_batches=8,
+            )
+            history["eval_loss"].append(eval_loss)
+            history["eval_epoch"].append(epoch)
+        else:
+            eval_loss = None
+
+        if should_log:
+            if eval_loss is None:
+                logger.info(
+                    "epoch={}/{} step={}/{} loss={:.6f} log_pxs={:.6f} kl={:.6f} kl_coeff={:.6f} lr={:.6g} grad_log_norm={:.6f}",
+                    epoch,
+                    total_epochs,
+                    step,
+                    total_steps,
+                    loss_value,
+                    log_pxs_value,
+                    kl_value,
+                    history["kl_coeff"][-1],
+                    history["lr"][-1],
+                    grad_norm,
+                )
+            else:
+                logger.info(
+                    "epoch={}/{} step={}/{} loss={:.6f} eval_loss={:.6f} log_pxs={:.6f} kl={:.6f} kl_coeff={:.6f} lr={:.6g} grad_log_norm={:.6f}",
+                    epoch,
+                    total_epochs,
+                    step,
+                    total_steps,
+                    loss_value,
+                    eval_loss,
+                    log_pxs_value,
+                    kl_value,
+                    history["kl_coeff"][-1],
+                    history["lr"][-1],
+                    grad_norm,
+                )
+
+        if is_epoch_end:
+            history["epoch"].append(epoch)
+            history["loss_epoch"].append(float(torch.tensor(epoch_losses).mean().item()))
+            history["log_pxs_epoch"].append(float(torch.tensor(epoch_log_pxs).mean().item()))
+            history["kl_epoch"].append(float(torch.tensor(epoch_kls).mean().item()))
+
+            should_compute_metrics = (
+                metric_real_paths is not None
+                and config.metrics_every_epoch > 0
+                and (epoch % config.metrics_every_epoch == 0 or step == total_steps)
+            )
+            if should_compute_metrics:
+                metrics = evaluate_latent_sde_path_metrics(
+                    model,
+                    metric_real_paths,
+                    ts,
+                    n_paths=config.metrics_n_paths,
+                    num_quantiles=config.metrics_num_quantiles,
+                    align_initial=config.metrics_align_initial,
+                    device=device,
+                    sample_method=config.sample_method,
+                    sample_dt=config.sample_dt,
+                )
+                history["metrics_epoch"].append(epoch)
+                history["expected_supremum_squared_error"].append(
+                    float(metrics["expected_supremum_squared_error"].detach().cpu().item())
+                )
+                history["marginal_w1_max"].append(
+                    float(metrics["marginal_w1_max"].detach().cpu().item())
+                )
+                history["marginal_w1_average"].append(
+                    float(metrics["marginal_w1_average"].detach().cpu().item())
+                )
+                logger.info(
+                    "epoch={}/{} metrics e_sup={:.6f} w1_max={:.6f} w1_avg={:.6f}",
+                    epoch,
+                    total_epochs,
+                    history["expected_supremum_squared_error"][-1],
+                    history["marginal_w1_max"][-1],
+                    history["marginal_w1_average"][-1],
+                )
+
+            epoch_losses = []
+            epoch_log_pxs = []
+            epoch_kls = []
+
+    if config.checkpoint_path:
+        checkpoint_path = Path(config.checkpoint_path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "history": history,
+                "train_config": config.__dict__,
+                "ts": ts.detach().cpu(),
+            },
+            checkpoint_path,
+        )
+        logger.info("Checkpoint saved: {}", checkpoint_path)
+
+    logger.info("Latent SDE training finished")
+    return history
+
+
+@torch.no_grad()
+def evaluate_sde_matching_loss(
+    model: "SDEMatching",
+    dataloader: DataLoader,
+    ts: torch.Tensor,
+    *,
+    device: torch.device | str,
+    max_batches: Optional[int] = None,
+) -> float:
+    model.eval()
+    device = torch.device(device)
+    ts = ts.to(device)
+
+    total_loss = 0.0
+    total_size = 0
+    for batch_idx, batch in enumerate(dataloader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+        paths = _unpack_path_batch(batch, device=device).to(dtype=ts.dtype)
+        loss = model(paths, ts).mean()
+        total_loss += float(loss.item()) * paths.size(0)
+        total_size += paths.size(0)
+
+    if total_size == 0:
+        raise ValueError("Cannot evaluate on an empty dataloader.")
+    return total_loss / total_size
+
+
+@torch.no_grad()
+def evaluate_sde_matching_path_metrics(
+    model: "SDEMatching",
+    real_paths: torch.Tensor,
+    ts: torch.Tensor,
+    *,
+    n_paths: int,
+    num_quantiles: int,
+    align_initial: bool,
+    device: torch.device | str,
+    sample_inner_steps: int = 1,
+) -> dict[str, torch.Tensor]:
+    model.eval()
+    device = torch.device(device)
+    ts = ts.to(device)
+    n_paths = min(int(n_paths), real_paths.size(0))
+    if n_paths < 1:
+        raise ValueError("n_paths must be >= 1")
+
+    real = real_paths[:n_paths].to(device=device, dtype=ts.dtype)
+    generated = model.sample_paths(
+        ts,
+        real[:, 0, :],
+        n_inner_steps=sample_inner_steps,
+    )
+    if align_initial:
+        generated = generated - generated[:, :1, :] + real[:, :1, :]
+    return compute_path_metrics(
+        real,
+        generated,
+        num_quantiles=num_quantiles,
+    )
+
+
+def train_sde_matching(
+    *,
+    model: "SDEMatching",
+    dataloader: DataLoader,
+    ts: torch.Tensor,
+    device: torch.device | str,
+    logger,
+    config: Optional[SDEMatchingTrainConfig] = None,
+    metric_real_paths: Optional[torch.Tensor] = None,
+) -> dict[str, list[float]]:
+    config = SDEMatchingTrainConfig() if config is None else config
+    if config.epochs < 1:
+        raise ValueError("epochs must be >= 1")
+    if config.steps is not None and config.steps < 1:
+        raise ValueError("steps must be >= 1 when provided")
+    if config.steps_per_epoch is not None and config.steps_per_epoch < 1:
+        raise ValueError("steps_per_epoch must be >= 1 when provided")
+    if config.sample_inner_steps < 1:
+        raise ValueError("sample_inner_steps must be >= 1")
+    if config.grad_clip_norm is not None and config.grad_clip_norm <= 0:
+        raise ValueError("grad_clip_norm must be positive when provided")
+    if hasattr(dataloader, "__len__") and len(dataloader) == 0:
+        raise ValueError(
+            "dataloader is empty; lower batch_size or disable drop_last for small datasets."
+        )
+
+    device = torch.device(device)
+    ts = ts.to(device)
+    model = model.to(device)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+    )
+
+    steps_per_epoch = config.steps_per_epoch or len(dataloader)
+    total_steps = config.steps or (config.epochs * steps_per_epoch)
+    total_epochs = (total_steps + steps_per_epoch - 1) // steps_per_epoch
+    if config.steps is None and config.steps_per_epoch is None and hasattr(logger, "warning"):
+        logger.warning(
+            "SDEMatching steps_per_epoch is inferred from len(dataloader)={}. "
+            "Changing dataset_size with a fixed batch_size changes the number of optimizer updates. "
+            "Set train.steps or train.steps_per_epoch explicitly for comparable runs.",
+            len(dataloader),
+        )
+
+    history: dict[str, list[float]] = {
+        "loss": [],
+        "loss_epoch": [],
+        "loss_prior": [],
+        "loss_prior_epoch": [],
+        "loss_diff": [],
+        "loss_diff_epoch": [],
+        "loss_recon": [],
+        "loss_recon_epoch": [],
+        "lr": [],
+        "grad_norm": [],
+        "eval_loss": [],
+        "eval_epoch": [],
+        "epoch": [],
+        "metrics_epoch": [],
+        "expected_supremum_squared_error": [],
+        "marginal_w1_max": [],
+        "marginal_w1_average": [],
+    }
+
+    batches = _cycle(dataloader)
+    logger.info(
+        "SDEMatching training started: epochs={}, steps={}, steps_per_epoch={}, batch_size={}, lr={}, sample_inner_steps={}, device={}",
+        total_epochs,
+        total_steps,
+        steps_per_epoch,
+        config.batch_size,
+        config.lr,
+        config.sample_inner_steps,
+        device,
+    )
+
+    epoch_losses: list[float] = []
+    epoch_prior: list[float] = []
+    epoch_diff: list[float] = []
+    epoch_recon: list[float] = []
+    for step in range(1, total_steps + 1):
+        epoch = (step - 1) // steps_per_epoch + 1
+        paths = _unpack_path_batch(next(batches), device=device).to(dtype=ts.dtype)
+
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        terms = model.loss_terms(paths, ts)
+        loss = terms["loss"].mean()
+        loss.backward()
+        if config.grad_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
+        optimizer.step()
+
+        loss_value = float(loss.detach().item())
+        prior_value = float(terms["loss_prior"].mean().detach().item())
+        diff_value = float(terms["loss_diff"].mean().detach().item())
+        recon_value = float(terms["loss_recon"].mean().detach().item())
+        grad_norm = _gradient_log_norm(model)
+
+        history["loss"].append(loss_value)
+        history["loss_prior"].append(prior_value)
+        history["loss_diff"].append(diff_value)
+        history["loss_recon"].append(recon_value)
+        history["lr"].append(_current_lr(optimizer))
+        history["grad_norm"].append(grad_norm)
+        epoch_losses.append(loss_value)
+        epoch_prior.append(prior_value)
+        epoch_diff.append(diff_value)
+        epoch_recon.append(recon_value)
+
+        is_epoch_end = step % steps_per_epoch == 0 or step == total_steps
+        should_log = step == 1 or step % config.log_every == 0 or is_epoch_end
+        should_eval = config.eval_every > 0 and (
+            step % config.eval_every == 0 or step == total_steps
+        )
+        if should_eval:
+            eval_loss = evaluate_sde_matching_loss(
+                model,
+                dataloader,
+                ts,
+                device=device,
+                max_batches=8,
+            )
+            history["eval_loss"].append(eval_loss)
+            history["eval_epoch"].append(epoch)
+        else:
+            eval_loss = None
+
+        if should_log:
+            if eval_loss is None:
+                logger.info(
+                    "epoch={}/{} step={}/{} loss={:.6f} prior={:.6f} diff={:.6f} recon={:.6f} lr={:.6g} grad_log_norm={:.6f}",
+                    epoch,
+                    total_epochs,
+                    step,
+                    total_steps,
+                    loss_value,
+                    prior_value,
+                    diff_value,
+                    recon_value,
+                    history["lr"][-1],
+                    grad_norm,
+                )
+            else:
+                logger.info(
+                    "epoch={}/{} step={}/{} loss={:.6f} eval_loss={:.6f} prior={:.6f} diff={:.6f} recon={:.6f} lr={:.6g} grad_log_norm={:.6f}",
+                    epoch,
+                    total_epochs,
+                    step,
+                    total_steps,
+                    loss_value,
+                    eval_loss,
+                    prior_value,
+                    diff_value,
+                    recon_value,
+                    history["lr"][-1],
+                    grad_norm,
+                )
+
+        if is_epoch_end:
+            history["epoch"].append(epoch)
+            history["loss_epoch"].append(float(torch.tensor(epoch_losses).mean().item()))
+            history["loss_prior_epoch"].append(float(torch.tensor(epoch_prior).mean().item()))
+            history["loss_diff_epoch"].append(float(torch.tensor(epoch_diff).mean().item()))
+            history["loss_recon_epoch"].append(float(torch.tensor(epoch_recon).mean().item()))
+
+            should_compute_metrics = (
+                metric_real_paths is not None
+                and config.metrics_every_epoch > 0
+                and (epoch % config.metrics_every_epoch == 0 or step == total_steps)
+            )
+            if should_compute_metrics:
+                metrics = evaluate_sde_matching_path_metrics(
+                    model,
+                    metric_real_paths,
+                    ts,
+                    n_paths=config.metrics_n_paths,
+                    num_quantiles=config.metrics_num_quantiles,
+                    align_initial=config.metrics_align_initial,
+                    device=device,
+                    sample_inner_steps=config.sample_inner_steps,
+                )
+                history["metrics_epoch"].append(epoch)
+                history["expected_supremum_squared_error"].append(
+                    float(metrics["expected_supremum_squared_error"].detach().cpu().item())
+                )
+                history["marginal_w1_max"].append(
+                    float(metrics["marginal_w1_max"].detach().cpu().item())
+                )
+                history["marginal_w1_average"].append(
+                    float(metrics["marginal_w1_average"].detach().cpu().item())
+                )
+                logger.info(
+                    "epoch={}/{} metrics e_sup={:.6f} w1_max={:.6f} w1_avg={:.6f}",
+                    epoch,
+                    total_epochs,
+                    history["expected_supremum_squared_error"][-1],
+                    history["marginal_w1_max"][-1],
+                    history["marginal_w1_average"][-1],
+                )
+
+            epoch_losses = []
+            epoch_prior = []
+            epoch_diff = []
+            epoch_recon = []
+
+    if config.checkpoint_path:
+        checkpoint_path = Path(config.checkpoint_path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "history": history,
+                "train_config": config.__dict__,
+                "ts": ts.detach().cpu(),
+            },
+            checkpoint_path,
+        )
+        logger.info("Checkpoint saved: {}", checkpoint_path)
+
+    logger.info("SDEMatching training finished")
     return history
 
 
