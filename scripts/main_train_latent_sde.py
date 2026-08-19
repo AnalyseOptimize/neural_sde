@@ -67,24 +67,8 @@ def maybe_add_perturbations(simulator, cfg: DictConfig):
         return simulator
 
     data_size = int(simulator.data_size)
-    gaussian = perturbations.get("gaussian", {})
     jumps = perturbations.get("jumps", {})
-    gaussian_enabled = bool(gaussian.get("enabled", False))
     jump_enabled = bool(jumps.get("enabled", False))
-
-    gaussian_variance = 0.0
-    gaussian_include_initial = True
-    gaussian_seed = None
-    if gaussian_enabled:
-        gaussian_variance = _as_float_or_list(
-            gaussian.get("variance", 0.0),
-            dim=data_size,
-            name="simulator.perturbations.gaussian.variance",
-        )
-        gaussian_include_initial = bool(gaussian.get("include_initial", True))
-        gaussian_seed = gaussian.get("seed")
-        if gaussian_seed is None:
-            gaussian_seed = int(cfg.seed) + 100_003
 
     jump_intensity = 0.0
     jump_size = 1.0
@@ -102,9 +86,6 @@ def maybe_add_perturbations(simulator, cfg: DictConfig):
 
     perturbed = PerturbedPathSimulator(
         base=simulator,
-        gaussian_variance=gaussian_variance,
-        gaussian_include_initial=gaussian_include_initial,
-        gaussian_seed=None if gaussian_seed is None else int(gaussian_seed),
         jump_intensity=jump_intensity,
         jump_size=jump_size,
         jump_seed=None if jump_seed is None else int(jump_seed),

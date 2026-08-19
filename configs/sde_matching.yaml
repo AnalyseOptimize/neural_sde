@@ -1,4 +1,4 @@
-run_name: sde_matching_abm
+run_name: sde_matching_ou
 seed: 0
 device: auto
 
@@ -7,21 +7,21 @@ paths:
 
 data:
   dataset_size: 8192
-  t_size: 41
-  dt: 0.025
+  t_size: 128
+  dt: 0.01
   normalize: false
   shuffle: true
   drop_last: true
   num_workers: 0
 
 simulator:
-  name: abm
+  name: ou
   abm:
-    dim: 1
+    dim: 2
     s0: 0.0
     mu: 0.1
     sigma: 0.2
-    rho: 0.0
+    rho: 0.5
     corr: null
   gbm:
     dim: 1
@@ -39,11 +39,6 @@ simulator:
     s0: 0.0
     mu: 0.1
   perturbations:
-    gaussian:
-      enabled: false
-      variance: 0.0
-      include_initial: true
-      seed: null
     jumps:
       enabled: false
       intensity: 0.0
@@ -52,11 +47,11 @@ simulator:
 
 model:
   latent_size: 4
-  hidden_size: 100
+  hidden_size: 32
   observation_noise_std: 0.01
 
 train:
-  epochs: 40
+  epochs: 100
   steps: 4000
   steps_per_epoch: 100
   batch_size: 1024

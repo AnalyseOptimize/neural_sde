@@ -39,11 +39,6 @@ simulator:
     s0: 0.0
     mu: 0.1
   perturbations:
-    gaussian:
-      enabled: false
-      variance: 0.0
-      include_initial: true
-      seed: null
     jumps:
       enabled: false
       intensity: 0.0
@@ -59,7 +54,7 @@ train:
   epochs: 150
   steps: null
   steps_per_epoch: null
-  batch_size: 1024
+  batch_size: 128
   lr: 1.0e-2
   lr_gamma: 0.997
   weight_decay: 0.0
