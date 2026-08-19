@@ -1,4 +1,4 @@
-run_name: sde_matching_ou
+run_name: sde_matching_abm
 seed: 0
 device: auto
 
@@ -6,16 +6,16 @@ paths:
   log_root: ${hydra:runtime.cwd}/logs
 
 data:
-  dataset_size: 8192
-  t_size: 128
-  dt: 0.01
+  dataset_size: 16192
+  t_size: 301
+  dt: 0.1
   normalize: false
   shuffle: true
   drop_last: true
   num_workers: 0
 
 simulator:
-  name: ou
+  name: abm
   abm:
     dim: 2
     s0: 0.0
@@ -52,7 +52,7 @@ model:
 
 train:
   epochs: 100
-  steps: 4000
+  steps: 10000
   steps_per_epoch: 100
   batch_size: 1024
   lr: 1.0e-3

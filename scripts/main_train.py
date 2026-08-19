@@ -23,12 +23,13 @@ from src.simulators import (
     OUSimulator,
     PerturbedPathSimulator,
 )
-from src.train import SDEGANTrainConfig, train_sdegan
+from src.train import SDEGANTrainConfig, sample_coupled_sdegan_paths, train_sdegan
 from utils.data import PathDataConfig, make_sdegan_dataset
 from utils.logging import log_config, setup_logger
 from utils.visual import (
     plot_constant_coefficient_history,
     plot_constant_diffusion_covariance_history,
+    plot_coupled_real_generated_paths,
     plot_epoch_diagnostics,
     plot_real_generated_paths,
     plot_simple_coefficient_slices,
@@ -254,12 +255,46 @@ def maybe_plot_simple_head_slices(
             )
 
 
+def maybe_plot_coupled_paths(
+    *,
+    cfg: DictConfig,
+    fig_dir: Path,
+    generator: SDEGenerator,
+    simulator,
+    ts: torch.Tensor,
+    device: torch.device,
+) -> None:
+    coupled_cfg = cfg.plots.get("coupled_paths", {})
+    if not bool(coupled_cfg.get("enabled", False)):
+        return
+    if bool(cfg.data.normalize):
+        return
+
+    n_paths = min(max(int(coupled_cfg.get("n_paths", 5)), 1), 5)
+    real, generated = sample_coupled_sdegan_paths(
+        generator,
+        simulator,
+        ts,
+        n_paths=n_paths,
+        device=device,
+        brownian_seed=coupled_cfg.get("brownian_seed", cfg.evaluation.get("brownian_seed", 0)),
+    )
+    plot_coupled_real_generated_paths(
+        ts.detach().cpu(),
+        real,
+        generated,
+        n_paths=n_paths,
+        save_path=fig_dir / "coupled_real_vs_generated_paths.pdf",
+    )
+
+
 def maybe_save_plots(
     *,
     cfg: DictConfig,
     fig_dir: Path,
     history: dict[str, list[float]],
     generator: SDEGenerator,
+    simulator,
     ts: torch.Tensor,
     real_paths: torch.Tensor,
     true_coefficients: dict[str, list[float]],
@@ -328,6 +363,14 @@ def maybe_save_plots(
         generator=generator,
         ts=ts,
         real_paths=real_paths,
+    )
+    maybe_plot_coupled_paths(
+        cfg=cfg,
+        fig_dir=fig_dir,
+        generator=generator,
+        simulator=simulator,
+        ts=ts,
+        device=device,
     )
 
     n_paths = min(int(cfg.plots.n_paths), real_paths.size(0))
@@ -475,6 +518,7 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
         fig_dir=run_paths.fig_dir,
         history=history,
         generator=generator,
+        simulator=simulator,
         ts=data.ts,
         real_paths=data.paths,
         true_coefficients=true_constant_coefficients(simulator),

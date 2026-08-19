@@ -72,6 +72,17 @@ def _format_axes(ax) -> None:
     ax.set_axisbelow(True)
 
 
+def _gradient_colors(n: int, *, cmap_name: str = "viridis") -> list:
+    if n < 1:
+        return []
+    if n == 1:
+        values = np.asarray([0.5])
+    else:
+        values = np.linspace(0.12, 0.84, int(n))
+    cmap = plt.get_cmap(cmap_name)
+    return [cmap(float(value)) for value in values]
+
+
 def _select_dimensions(paths: np.ndarray, dimensions: Iterable[int] | None) -> list[int]:
     if dimensions is None:
         return list(range(paths.shape[-1]))
@@ -152,6 +163,82 @@ def plot_real_generated_paths(
                     alpha=alpha,
                     linewidth=linewidth,
                     label=label,
+                )
+
+            ax.set_ylabel(r"$S_t$" if real.shape[-1] == 1 else rf"$S_t^{{({dim + 1})}}$")
+            _format_axes(ax)
+            ax.legend(frameon=False, loc="best")
+
+        axes[-1].set_xlabel("Time")
+        fig.tight_layout()
+    return _save_or_return(fig, save_path)
+
+
+def plot_coupled_real_generated_paths(
+    ts,
+    real_paths,
+    generated_paths,
+    *,
+    n_paths: int = 5,
+    dimensions: Iterable[int] | None = None,
+    real_label: str = "True process",
+    generated_label: str = "Generator",
+    save_path: str | Path | None = None,
+):
+    """
+    Plot pathwise-coupled real and generated trajectories.
+
+    Each pair is drawn in the same color: the real path is solid and the
+    generated path is dashed.
+    """
+
+    real = _as_paths(real_paths, name="real_paths")
+    generated = _as_paths(generated_paths, name="generated_paths")
+    if real.shape[1:] != generated.shape[1:]:
+        raise ValueError(
+            "real_paths and generated_paths must have matching time and data dimensions; "
+            f"got {real.shape[1:]} and {generated.shape[1:]}"
+        )
+
+    n = min(int(n_paths), real.shape[0], generated.shape[0], 5)
+    if n < 1:
+        raise ValueError("n_paths must be >= 1")
+
+    real = real[:n]
+    generated = generated[:n]
+    ts = _as_ts(ts, expected_steps=real.shape[1])
+    dims = _select_dimensions(real, dimensions)
+
+    with _scientific_style():
+        fig, axes = plt.subplots(
+            len(dims),
+            1,
+            figsize=(6.4, max(2.7, 2.3 * len(dims))),
+            sharex=True,
+            squeeze=False,
+        )
+        axes = axes[:, 0]
+        colors = _gradient_colors(n)
+
+        for ax, dim in zip(axes, dims):
+            for idx in range(n):
+                ax.plot(
+                    ts,
+                    real[idx, :, dim],
+                    color=colors[idx],
+                    alpha=0.94,
+                    linewidth=1.15,
+                    linestyle="-",
+                    label=real_label if idx == 0 else None,
+                )
+                ax.plot(
+                    ts,
+                    generated[idx, :, dim],
+                    color=colors[idx],
+                    alpha=0.94,
+                    linewidth=1.15,
+                    linestyle=(0, (4.0, 2.2)),
+                    label=generated_label if idx == 0 else None,
                 )
 
             ax.set_ylabel(r"$S_t$" if real.shape[-1] == 1 else rf"$S_t^{{({dim + 1})}}$")
@@ -827,16 +914,16 @@ def plot_simple_coefficient_slices(
     with _scientific_style():
         fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.2), squeeze=False)
         ax_t, ax_s = axes[0]
-        colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        time_colors = _gradient_colors(len(time_slices))
+        state_colors = _gradient_colors(len(state_slices))
         pretty = "Drift" if coefficient == "drift" else "Diffusion"
         component_text = _component_label(coefficient=coefficient, component=component)
 
         for idx, values in enumerate(time_slices):
-            color = colors[idx % len(colors)]
             ax_t.plot(
                 t_grid_np,
                 values,
-                color=color,
+                color=time_colors[idx],
                 label=rf"$S_t={state_levels_np[idx]:.3g}$",
             )
         ax_t.set_xlabel("Time")
@@ -846,11 +933,10 @@ def plot_simple_coefficient_slices(
         ax_t.legend(frameon=False, loc="best")
 
         for idx, values in enumerate(state_slices):
-            color = colors[idx % len(colors)]
             ax_s.plot(
                 state_grid_np,
                 values,
-                color=color,
+                color=state_colors[idx],
                 label=rf"$t={time_levels_np[idx]:.3g}$",
             )
         ax_s.set_xlabel(r"$S_t$")

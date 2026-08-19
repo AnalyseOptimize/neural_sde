@@ -734,13 +734,17 @@ def _save_reference_simple_slices(
     ):
         fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.2), squeeze=False)
         ax_t, ax_h = axes[0]
-        colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        if int(n_levels) == 1:
+            color_values = np.asarray([0.5])
+        else:
+            color_values = np.linspace(0.12, 0.84, int(n_levels))
+        colors = [plt.get_cmap("viridis")(float(value)) for value in color_values]
         pretty = "Drift" if coefficient == "drift" else "Diffusion"
         for idx, values in enumerate(time_slices):
             ax_t.plot(
                 t_grid.detach().cpu().numpy(),
                 values,
-                color=colors[idx % len(colors)],
+                color=colors[idx],
                 label=rf"$X={float(h_levels[idx]):.3g}$",
             )
         ax_t.set_xlabel("Normalized time")
@@ -755,7 +759,7 @@ def _save_reference_simple_slices(
             ax_h.plot(
                 h_grid.detach().cpu().numpy(),
                 values,
-                color=colors[idx % len(colors)],
+                color=colors[idx],
                 label=rf"$t={float(t_levels[idx]):.3g}$",
             )
         ax_h.set_xlabel(r"Hidden state $X_t$")

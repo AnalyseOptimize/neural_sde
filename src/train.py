@@ -350,6 +350,114 @@ def _simulate_coupled_real_paths(
     return paths
 
 
+@torch.no_grad()
+def sample_coupled_sdegan_paths(
+    generator: "SDEGenerator",
+    simulator,
+    ts: torch.Tensor,
+    *,
+    n_paths: int,
+    device: torch.device | str,
+    brownian_seed: Optional[int] = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample real and SDEGAN paths driven by the same Brownian motion."""
+
+    generator.eval()
+    device = torch.device(device)
+    ts = ts.to(device)
+    n_paths = int(n_paths)
+    if n_paths < 1:
+        raise ValueError("n_paths must be >= 1")
+    if generator.noise_size != getattr(simulator, "data_size", generator.noise_size):
+        raise ValueError(
+            "Coupled Brownian paths require generator.noise_size to match "
+            f"simulator.data_size; got {generator.noise_size} and {simulator.data_size}."
+        )
+
+    bm = _make_brownian_interval(
+        ts,
+        batch_size=n_paths,
+        noise_size=generator.noise_size,
+        device=device,
+        dtype=ts.dtype,
+        seed=brownian_seed,
+    )
+    brownian_increments = _brownian_grid_increments(bm, ts)
+    real = _simulate_coupled_real_paths(
+        simulator,
+        ts=ts,
+        brownian_increments=brownian_increments,
+        device=device,
+        dtype=ts.dtype,
+    )
+    generated = generator.sample_paths(ts, real[:, 0, :], bm=bm)
+    return real.detach().cpu(), generated.detach().cpu()
+
+
+@torch.no_grad()
+def sample_coupled_sde_ml_paths(
+    model: "SDEML",
+    simulator,
+    ts: torch.Tensor,
+    *,
+    n_paths: int,
+    device: torch.device | str,
+    sampling_backend: str = "torchsde",
+    brownian_seed: Optional[int] = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample real and SDE-ML paths driven by the same Brownian motion."""
+
+    model.eval()
+    device = torch.device(device)
+    ts = ts.to(device)
+    sampling_backend = _normalize_sde_ml_sampling_backend(sampling_backend)
+    n_paths = int(n_paths)
+    if n_paths < 1:
+        raise ValueError("n_paths must be >= 1")
+    if model.noise_size != getattr(simulator, "data_size", model.noise_size):
+        raise ValueError(
+            "Coupled Brownian paths require model.noise_size to match "
+            f"simulator.data_size; got {model.noise_size} and {simulator.data_size}."
+        )
+
+    if sampling_backend == "direct":
+        bm = None
+        brownian_increments = _make_grid_brownian_increments(
+            ts,
+            batch_size=n_paths,
+            noise_size=model.noise_size,
+            device=device,
+            dtype=ts.dtype,
+            seed=brownian_seed,
+        )
+    else:
+        bm = _make_brownian_interval(
+            ts,
+            batch_size=n_paths,
+            noise_size=model.noise_size,
+            device=device,
+            dtype=ts.dtype,
+            seed=brownian_seed,
+        )
+        brownian_increments = _brownian_grid_increments(bm, ts)
+
+    real = _simulate_coupled_real_paths(
+        simulator,
+        ts=ts,
+        brownian_increments=brownian_increments,
+        device=device,
+        dtype=ts.dtype,
+    )
+    generated = model.sample_paths(
+        ts,
+        y0=real[:, 0, :],
+        bm=bm,
+        brownian_increments=brownian_increments if sampling_backend == "direct" else None,
+        backend=sampling_backend,
+    )
+    return real.detach().cpu(), generated.detach().cpu()
+
+
 def _sde_ml_negative_log_likelihood(
     model: "SDEML",
     ts: torch.Tensor,

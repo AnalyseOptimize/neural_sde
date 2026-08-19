@@ -114,6 +114,10 @@ plots:
   enabled: true
   n_paths: 24
   align_initial: true
+  coupled_paths:
+    enabled: true
+    n_paths: 5
+    brownian_seed: ${evaluation.brownian_seed}
   simple_slices:
     enabled: true
     n_grid: 128

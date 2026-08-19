@@ -1,4 +1,4 @@
-run_name: sde_ml_mabm_simple_jumps
+run_name: sde_ml_mabm_simple_jumps_test
 seed: 0
 device: auto
 
@@ -80,8 +80,8 @@ model:
   sampling_backend: torchsde
 
 train:
-  epochs: 100
-  steps: 1000
+  epochs: 1
+  steps: 10
   steps_per_epoch: 10
   batch_size: 1024
   lr: 1.0e-3
@@ -111,6 +111,11 @@ plots:
   enabled: true
   n_paths: 24
   align_initial: true
+  coupled_paths:
+    enabled: true
+    n_paths: 5
+    brownian_seed: ${evaluation.brownian_seed}
+    sampling_backend: ${train.sampling_backend}
   simple_slices:
     enabled: true
     n_grid: 128

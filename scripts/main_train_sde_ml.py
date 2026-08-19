@@ -24,12 +24,13 @@ from src.simulators import (
     OUSimulator,
     PerturbedPathSimulator,
 )
-from src.train import SDEMLTrainConfig, train_sde_ml
+from src.train import SDEMLTrainConfig, sample_coupled_sde_ml_paths, train_sde_ml
 from utils.data import PathDataConfig, normalize_paths_by_initial, validate_paths
 from utils.logging import log_config, setup_logger
 from utils.visual import (
     plot_constant_coefficient_history,
     plot_constant_diffusion_covariance_history,
+    plot_coupled_real_generated_paths,
     plot_epoch_diagnostics,
     plot_real_generated_paths,
     plot_simple_coefficient_slices,
@@ -249,6 +250,46 @@ def maybe_plot_simple_head_slices(
             )
 
 
+def maybe_plot_coupled_paths(
+    *,
+    cfg: DictConfig,
+    fig_dir: Path,
+    model: SDEML,
+    simulator,
+    ts: torch.Tensor,
+    device: torch.device,
+) -> None:
+    coupled_cfg = cfg.plots.get("coupled_paths", {})
+    if not bool(coupled_cfg.get("enabled", False)):
+        return
+    if bool(cfg.data.normalize):
+        return
+
+    n_paths = min(max(int(coupled_cfg.get("n_paths", 5)), 1), 5)
+    sampling_backend = str(
+        coupled_cfg.get(
+            "sampling_backend",
+            cfg.train.get("sampling_backend", cfg.model.get("sampling_backend", "torchsde")),
+        )
+    )
+    real, generated = sample_coupled_sde_ml_paths(
+        model,
+        simulator,
+        ts,
+        n_paths=n_paths,
+        device=device,
+        sampling_backend=sampling_backend,
+        brownian_seed=coupled_cfg.get("brownian_seed", cfg.evaluation.get("brownian_seed", 0)),
+    )
+    plot_coupled_real_generated_paths(
+        ts.detach().cpu(),
+        real,
+        generated,
+        n_paths=n_paths,
+        save_path=fig_dir / "coupled_real_vs_generated_paths.pdf",
+    )
+
+
 def make_path_dataloader(
     *,
     simulator,
@@ -320,6 +361,7 @@ def maybe_save_plots(
     fig_dir: Path,
     history: dict[str, list[float]],
     model: SDEML,
+    simulator,
     ts: torch.Tensor,
     real_paths: torch.Tensor,
     true_coefficients: dict[str, list[float]],
@@ -392,6 +434,14 @@ def maybe_save_plots(
         model=model,
         ts=ts,
         real_paths=real_paths,
+    )
+    maybe_plot_coupled_paths(
+        cfg=cfg,
+        fig_dir=fig_dir,
+        model=model,
+        simulator=simulator,
+        ts=ts,
+        device=device,
     )
 
     n_paths = min(int(cfg.plots.n_paths), real_paths.size(0))
@@ -564,6 +614,7 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
         fig_dir=run_paths.fig_dir,
         history=history,
         model=model,
+        simulator=simulator,
         ts=ts,
         real_paths=paths,
         true_coefficients=true_constant_coefficients(simulator),
