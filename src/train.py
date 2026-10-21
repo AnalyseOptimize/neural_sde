@@ -1259,6 +1259,7 @@ def train_latent_sde(
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
+                "model_config": model.config.__dict__,
                 "history": history,
                 "train_config": config.__dict__,
                 "ts": ts.detach().cpu(),

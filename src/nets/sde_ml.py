@@ -499,6 +499,17 @@ class ObservableSDEFunc(nn.Module):
         ts = _validate_ts(ts, expected_steps=paths.size(1))
         paths = _validate_paths(paths)
 
+        # Fully observed Markov paths can evaluate all transitions in one batch.
+        if self.max_window_size == 1:
+            batch_size, n_steps, _ = paths.shape
+            times = ts[:-1].expand(batch_size, -1).reshape(-1, 1)
+            window = paths[:, :-1].reshape(-1, 1, self.data_size)
+            times = self._normalize_t(times)
+            window = self._normalize_window(window)
+            drift = self.drift(times, window).reshape(batch_size, n_steps - 1, self.data_size)
+            diffusion = self._format_diffusion(self.diffusion(times, window))
+            return drift, diffusion.reshape(batch_size, n_steps - 1, *diffusion.shape[1:])
+
         drifts = []
         diffusions = []
         for time_idx in range(paths.size(1) - 1):

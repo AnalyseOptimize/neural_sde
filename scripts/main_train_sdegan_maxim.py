@@ -732,12 +732,12 @@ def _save_reference_simple_slices(
             "ps.fonttype": 42,
         }
     ):
-        fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.2), squeeze=False)
+        fig, axes = plt.subplots(1, 2, figsize=(9.2, 3.5), squeeze=False)
         ax_t, ax_h = axes[0]
         if int(n_levels) == 1:
             color_values = np.asarray([0.5])
         else:
-            color_values = np.linspace(0.12, 0.84, int(n_levels))
+            color_values = np.linspace(0.0, 1.0, int(n_levels))
         colors = [plt.get_cmap("viridis")(float(value)) for value in color_values]
         pretty = "Drift" if coefficient == "drift" else "Diffusion"
         for idx, values in enumerate(time_slices):
@@ -753,7 +753,7 @@ def _save_reference_simple_slices(
         ax_t.spines["top"].set_visible(False)
         ax_t.spines["right"].set_visible(False)
         ax_t.grid(True, color="0.88", linewidth=0.6)
-        ax_t.legend(frameon=False, loc="best")
+        fig.colorbar(plt.cm.ScalarMappable(norm=plt.Normalize(-2.0, 2.0), cmap="viridis"), ax=ax_t, label="Fixed hidden state")
 
         for idx, values in enumerate(state_slices):
             ax_h.plot(
@@ -768,7 +768,7 @@ def _save_reference_simple_slices(
         ax_h.spines["top"].set_visible(False)
         ax_h.spines["right"].set_visible(False)
         ax_h.grid(True, color="0.88", linewidth=0.6)
-        ax_h.legend(frameon=False, loc="best")
+        fig.colorbar(plt.cm.ScalarMappable(norm=plt.Normalize(0.0, 1.0), cmap="viridis"), ax=ax_h, label="Fixed time")
         fig.tight_layout()
 
     save_path = fig_dir / f"maxim_simple_{coefficient}_hidden_slices.pdf"
@@ -829,7 +829,7 @@ def maybe_save_plots(
                 coefficient=coefficient,
                 fig_dir=fig_dir,
                 n_grid=int(simple_cfg.get("n_grid", 128)),
-                n_levels=int(simple_cfg.get("n_levels", 5)),
+                n_levels=int(simple_cfg.get("n_levels", 40)),
                 hidden_dimension=int(simple_cfg.get("hidden_dimension", 0)),
             )
 

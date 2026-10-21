@@ -487,7 +487,7 @@ class MultiDimensionalGBMSimulator:
 class OUSimulator:
     """Exact one-dimensional OU simulator: dS = theta * (mu - S) dt + sigma dW."""
 
-    s0: float = 1.0
+    s0: float = 2.0
     theta: float = 1.0
     mu: float = 0.0
     sigma: float = 0.3
@@ -499,6 +499,11 @@ class OUSimulator:
 
     def constant_coefficients(self) -> dict[str, torch.Tensor]:
         return {"diffusion": torch.tensor([float(self.sigma)], dtype=torch.float32)}
+
+    def f_and_g(self, t: torch.Tensor, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Continuous-time coefficients, for comparison with fitted functions."""
+        del t
+        return self.theta * (self.mu - states), torch.full_like(states, self.sigma)
 
     def simulate(
         self,

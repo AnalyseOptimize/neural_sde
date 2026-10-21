@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Iterable, Literal
 
 import matplotlib.pyplot as plt
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
 import numpy as np
 import torch
 
@@ -756,6 +758,10 @@ def _state_slice_range(real_paths: np.ndarray, state_dimension: int) -> tuple[fl
         return -1.0, 1.0
 
     low, high = np.quantile(values, [0.02, 0.98])
+    # Include the transient even when it occupies a small fraction of the data.
+    initial = real_paths[:, 0, state_dimension]
+    low = min(low, float(np.nanmin(initial)))
+    high = max(high, float(np.nanmax(initial)))
     if not np.isfinite(low) or not np.isfinite(high):
         return -1.0, 1.0
     if high <= low + 1e-12:
@@ -844,7 +850,8 @@ def plot_simple_coefficient_slices(
     component: int | tuple[int, int] = 0,
     state_dimension: int = 0,
     n_grid: int = 128,
-    n_levels: int = 5,
+    n_levels: int = 40,
+    reference=None,
     save_path: str | Path | None = None,
 ):
     """
@@ -882,22 +889,17 @@ def plot_simple_coefficient_slices(
 
     time_slices = []
     state_slices = []
+    was_training = model.training
     model.eval()
     with torch.no_grad():
-        for state_value in state_levels_np:
-            states = baseline.view(1, -1).expand(t_grid.numel(), -1).clone()
-            states[:, int(state_dimension)] = float(state_value)
-            values = []
-            for idx in range(t_grid.numel()):
-                value = _evaluate_coefficient_component(
-                    model,
-                    coefficient,
-                    t=t_grid[idx],
-                    states=states[idx : idx + 1],
-                    component=component,
-                )
-                values.append(value.squeeze(0))
-            time_slices.append(torch.stack(values).detach().cpu().numpy())
+        states = baseline.view(1, -1).expand(int(n_levels), -1).clone()
+        states[:, int(state_dimension)] = torch.as_tensor(state_levels_np, device=device, dtype=dtype)
+        for t in t_grid:
+            values = _evaluate_coefficient_component(
+                model, coefficient, t=t, states=states, component=component,
+            )
+            time_slices.append(values.cpu().numpy())
+        time_slices = np.stack(time_slices, axis=1)
 
         for time_value in time_levels_np:
             states = baseline.view(1, -1).expand(state_grid.numel(), -1).clone()
@@ -910,12 +912,16 @@ def plot_simple_coefficient_slices(
                 component=component,
             )
             state_slices.append(values.detach().cpu().numpy())
+    model.train(was_training)
 
     with _scientific_style():
-        fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.2), squeeze=False)
+        fig, axes = plt.subplots(1, 2, figsize=(9.2, 3.5), squeeze=False)
         ax_t, ax_s = axes[0]
-        time_colors = _gradient_colors(len(time_slices))
-        state_colors = _gradient_colors(len(state_slices))
+        cmap = plt.get_cmap("viridis")
+        state_norm = Normalize(state_low, state_high)
+        time_norm = Normalize(float(ts_np[0]), float(ts_np[-1]))
+        time_colors = cmap(state_norm(state_levels_np))
+        state_colors = cmap(time_norm(time_levels_np))
         pretty = "Drift" if coefficient == "drift" else "Diffusion"
         component_text = _component_label(coefficient=coefficient, component=component)
 
@@ -930,7 +936,7 @@ def plot_simple_coefficient_slices(
         ax_t.set_ylabel(f"{pretty} coefficient")
         ax_t.set_title(rf"{component_text} as a function of $t$")
         _format_axes(ax_t)
-        ax_t.legend(frameon=False, loc="best")
+        fig.colorbar(ScalarMappable(norm=state_norm, cmap=cmap), ax=ax_t, label=r"Fixed $S_t$")
 
         for idx, values in enumerate(state_slices):
             ax_s.plot(
@@ -943,7 +949,18 @@ def plot_simple_coefficient_slices(
         ax_s.set_ylabel(f"{pretty} coefficient")
         ax_s.set_title(rf"{component_text} as a function of $S_t$")
         _format_axes(ax_s)
-        ax_s.legend(frameon=False, loc="best")
+        fig.colorbar(ScalarMappable(norm=time_norm, cmap=cmap), ax=ax_s, label="Fixed time")
+
+        if reference is not None:
+            # OU is time homogeneous: one dashed curve is the exact reference.
+            with torch.no_grad():
+                drift, diffusion = reference.f_and_g(t_grid[0], states)
+                truth = _select_coefficient_component(
+                    drift if coefficient == "drift" else diffusion,
+                    coefficient=coefficient, component=component,
+                ).cpu().numpy()
+            ax_s.plot(state_grid_np, truth, "k--", linewidth=1.8)
+            ax_s.set_title(ax_s.get_title() + " (dashed: true)")
 
         fig.tight_layout()
     return _save_or_return(fig, save_path)

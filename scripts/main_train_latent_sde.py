@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import random
 import sys
 from pathlib import Path
@@ -17,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.nets.latent_sde import ConditionalLatentSDE
+from src.nets.latent_sde import ConditionalLatentSDE, LatentSDEConfig
 from src.simulators import (
     ArithmeticBrownianMotionSimulator,
     DeterministicDriftSimulator,
@@ -208,10 +209,24 @@ def maybe_save_plots(
         return
 
     fig_dir.mkdir(parents=True, exist_ok=True)
+    n_paths = min(int(cfg.plots.n_paths), real_paths.size(0))
+    model.eval()
     fig = plot_epoch_diagnostics(
         history,
         option="loss",
         save_path=fig_dir / "latent_sde_loss_by_epoch.pdf",
+    )
+    plt.close(fig)
+
+    reconstructed = model.reconstruct_paths(
+        real_paths[:n_paths].to(device), ts.to(device),
+        method=cfg.train.sample_method, dt=float(cfg.train.sample_dt),
+        sample_observations=False,
+    ).cpu()
+    fig = plot_real_generated_paths(
+        ts.cpu(), real_paths[:n_paths].cpu(), reconstructed,
+        n_paths=n_paths, align_initial=False,
+        save_path=fig_dir / "real_vs_posterior_reconstruction.pdf",
     )
     plt.close(fig)
     if history.get("marginal_w1_average") or history.get("marginal_w1_max"):
@@ -221,8 +236,6 @@ def maybe_save_plots(
         fig = plot_epoch_diagnostics(history, option="e_sup", save_path=fig_dir / "e_sup_by_epoch.pdf")
         plt.close(fig)
 
-    n_paths = min(int(cfg.plots.n_paths), real_paths.size(0))
-    model.eval()
     with torch.no_grad():
         y0 = real_paths[:n_paths, 0, :].to(device=device, dtype=ts.dtype)
         generated = model.sample_paths(
@@ -249,6 +262,7 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
 
     run_logger, run_paths = setup_logger(cfg.paths.log_root, cfg.run_name)
     log_config(run_logger, _to_container(cfg))
+    OmegaConf.save(OmegaConf.create(_to_container(cfg)), run_paths.run_dir / "config.yaml")
 
     device = resolve_device(str(cfg.device))
     checkpoint_path = None
@@ -278,12 +292,10 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
         len(dataloader),
     )
 
-    model = ConditionalLatentSDE(
-        data_size=paths.size(-1),
-        latent_size=int(cfg.model.latent_size),
-        context_size=int(cfg.model.context_size),
-        hidden_size=int(cfg.model.hidden_size),
-    )
+    model = ConditionalLatentSDE.from_config(LatentSDEConfig(
+        data_size=paths.size(-1), **_to_container(cfg.model),
+    ))
+    run_logger.info("Latent SDE encoder={}, decoder={}", model.encoder_type, model.decoder_type)
     run_logger.info(
         "Latent SDE prepared: params={}, data_size={}, latent_size={}, context_size={}, hidden_size={}",
         sum(param.numel() for param in model.parameters()),
@@ -331,6 +343,7 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
         config=train_config,
         metric_real_paths=paths if bool(cfg.evaluation.enabled) else None,
     )
+    (run_paths.run_dir / "history.json").write_text(json.dumps(history, indent=2) + "\n")
 
     maybe_save_plots(
         cfg=cfg,

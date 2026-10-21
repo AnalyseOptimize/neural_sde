@@ -229,7 +229,7 @@ def maybe_plot_simple_head_slices(
         return
 
     n_grid = int(simple_cfg.get("n_grid", 128))
-    n_levels = int(simple_cfg.get("n_levels", 5))
+    n_levels = int(simple_cfg.get("n_levels", 40))
     state_dimension = int(simple_cfg.get("state_dimension", 0))
     head_types = {
         "drift": str(cfg.model.generator.drift_head).lower(),

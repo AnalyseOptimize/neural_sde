@@ -1,0 +1,8 @@
+defaults:
+  - latent_sde
+  - _self_
+
+run_name: latent_sde_ou_deterministic
+model:
+  encoder_type: deterministic
+  decoder_type: deterministic

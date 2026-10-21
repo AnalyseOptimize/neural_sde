@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import json
+from dataclasses import replace
 import random
 import sys
 from pathlib import Path
@@ -27,6 +29,7 @@ from src.simulators import (
 from src.train import SDEMLTrainConfig, sample_coupled_sde_ml_paths, train_sde_ml
 from utils.data import PathDataConfig, normalize_paths_by_initial, validate_paths
 from utils.logging import log_config, setup_logger
+from utils.calibration import save_ou_calibration
 from utils.visual import (
     plot_constant_coefficient_history,
     plot_constant_diffusion_covariance_history,
@@ -218,13 +221,14 @@ def maybe_plot_simple_head_slices(
     model: SDEML,
     ts: torch.Tensor,
     real_paths: torch.Tensor,
+    reference=None,
 ) -> None:
     simple_cfg = cfg.plots.get("simple_slices", {})
     if not bool(simple_cfg.get("enabled", True)):
         return
 
     n_grid = int(simple_cfg.get("n_grid", 128))
-    n_levels = int(simple_cfg.get("n_levels", 5))
+    n_levels = int(simple_cfg.get("n_levels", 40))
     state_dimension = int(simple_cfg.get("state_dimension", 0))
     head_types = {
         "drift": str(cfg.model.drift_head).lower(),
@@ -246,6 +250,7 @@ def maybe_plot_simple_head_slices(
                 state_dimension=state_dimension,
                 n_grid=n_grid,
                 n_levels=n_levels,
+                reference=reference if coefficient == "drift" or model.noise_type == "diagonal" else None,
                 save_path=fig_dir / f"simple_{coefficient}_slices{suffix}.pdf",
             )
 
@@ -434,6 +439,7 @@ def maybe_save_plots(
         model=model,
         ts=ts,
         real_paths=real_paths,
+        reference=simulator if isinstance(simulator, OUSimulator) and not cfg.data.normalize else None,
     )
     maybe_plot_coupled_paths(
         cfg=cfg,
@@ -470,6 +476,7 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
 
     run_logger, run_paths = setup_logger(cfg.paths.log_root, cfg.run_name)
     log_config(run_logger, _to_container(cfg))
+    OmegaConf.save(OmegaConf.create(_to_container(cfg)), run_paths.run_dir / "config.yaml")
 
     device = resolve_device(str(cfg.device))
     checkpoint_path = None
@@ -608,6 +615,21 @@ def main(cfg: DictConfig) -> dict[str, list[float]]:
         metric_real_paths=paths if bool(cfg.evaluation.enabled) else None,
         metric_simulator=metric_simulator,
     )
+    (run_paths.run_dir / "history.json").write_text(json.dumps(history, indent=2) + "\n")
+
+    calibration_cfg = cfg.plots.get("coefficient_calibration", {})
+    if (bool(cfg.plots.enabled) and bool(calibration_cfg.get("enabled", True))
+            and isinstance(simulator, OUSimulator) and not data_config.normalize):
+        validation_simulator = replace(simulator, seed=int(cfg.seed) + 1_000_003)
+        validation_ts, validation_paths = validation_simulator.simulate(
+            n_paths=int(calibration_cfg.get("n_paths", 512)),
+            n_steps=data_config.t_size, dt=data_config.dt,
+        )
+        calibration = save_ou_calibration(
+            model, validation_simulator, validation_ts, validation_paths, run_paths.run_dir,
+            n_grid=int(cfg.plots.simple_slices.n_grid), n_levels=int(cfg.plots.simple_slices.n_levels),
+        )
+        run_logger.info("OU coefficient recovery: {}", json.dumps(calibration, indent=2))
 
     maybe_save_plots(
         cfg=cfg,

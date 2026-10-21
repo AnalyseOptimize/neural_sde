@@ -31,10 +31,10 @@ simulator:
     rho: 0.0
     corr: null
   ou:
-    s0: 1.0
-    theta: 0.1
-    mu: 0.02
-    sigma: 0.4
+    s0: 2.0
+    theta: 1.0
+    mu: 0.0
+    sigma: 0.3
   deterministic:
     s0: 0.0
     mu: 0.1
@@ -121,7 +121,7 @@ plots:
   simple_slices:
     enabled: true
     n_grid: 128
-    n_levels: 5
+    n_levels: 40
     state_dimension: 0
 
 hydra:

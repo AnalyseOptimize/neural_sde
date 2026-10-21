@@ -1,41 +1,27 @@
 from __future__ import annotations
 
+"""Conditional latent SDE with a small affine prior and shared diffusion.
+
+Reference: Li et al. (2020), Scalable Gradients for Stochastic Differential
+Equations; google-research/torchsde, examples/latent_sde{,_lorenz}.py.
+The public path layout is (batch, time, channel), as in the other models here.
+"""
+
 from dataclasses import dataclass
+import math
 from typing import Optional
 
 import torch
 from torch import nn
 from torch.distributions import Normal, kl_divergence
+import torchsde
 
-try:
-    import torchsde
-except ImportError as exc:  # pragma: no cover - exercised only in incomplete envs.
-    raise ImportError("Latent SDE requires torchsde.") from exc
-
-
-def _validate_ts(ts: torch.Tensor, *, expected_steps: int | None = None) -> torch.Tensor:
-    if ts.ndim != 1:
-        raise ValueError(f"ts must have shape (T,), got {tuple(ts.shape)}")
-    if ts.numel() < 2:
-        raise ValueError("ts must contain at least two time points")
-    if expected_steps is not None and ts.numel() != expected_steps:
-        raise ValueError(f"ts has T={ts.numel()}, expected T={expected_steps}")
-    if not bool(torch.all(ts[1:] > ts[:-1])):
-        raise ValueError("ts must be strictly increasing")
-    return ts
-
-
-def _validate_paths(paths: torch.Tensor) -> torch.Tensor:
-    if paths.ndim == 2:
-        paths = paths.unsqueeze(-1)
-    if paths.ndim != 3:
-        raise ValueError(f"paths must have shape (B, T, D) or (B, T), got {tuple(paths.shape)}")
-    if paths.size(0) < 1 or paths.size(1) < 2 or paths.size(2) < 1:
-        raise ValueError("paths must have non-empty B, at least two time steps, and non-empty D")
-    return paths
+from src.nets.sde_ml import _validate_paths, _validate_ts
 
 
 class Encoder(nn.Module):
+    """Backward GRU context; time is an explicit input for irregular grids."""
+
     def __init__(self, input_size: int, hidden_size: int, output_size: int) -> None:
         super().__init__()
         self.gru = nn.GRU(input_size=input_size, hidden_size=hidden_size)
@@ -49,13 +35,31 @@ class Encoder(nn.Module):
 @dataclass(frozen=True)
 class LatentSDEConfig:
     data_size: int
-    latent_size: int = 4
-    context_size: int = 64
-    hidden_size: int = 128
+    latent_size: int = 2
+    context_size: int = 16
+    hidden_size: int = 16
+    encoder_type: str = "stochastic"
+    decoder_type: str = "deterministic"
+    diffusion_init: float = 0.3
+    diffusion_min: float = 1e-3
+    decoder_std_init: float = 0.05
+    decoder_std_min: float = 1e-3
 
 
 class ConditionalLatentSDE(nn.Module):
-    """Latent SDE from torchsde examples with a Y0-conditional latent prior."""
+    """Learn p(x[1:] | x[0]) using a posterior SDE and a conditional prior.
+
+    h: affine prior drift; f: h plus a context MLP; g: positive, constant,
+    diagonal diffusion shared by both SDEs. torchsde integrates path KL.
+
+    Stochastic encoder: Gaussian q(z0 | x[0:T]), p(z0 | x0), analytic KL0.
+    Deterministic encoder: both start at the SAME learned embedding of x0,
+    so KL0 is exactly zero (no invalid Dirac-versus-Gaussian KL).
+
+    Deterministic decoder: linear readout, fixed Gaussian training likelihood.
+    Stochastic decoder: linear mean and learned diagonal observation scale.
+    Both modes still have Brownian noise in the latent dynamics.
+    """
 
     sde_type = "ito"
     noise_type = "diagonal"
@@ -63,51 +67,64 @@ class ConditionalLatentSDE(nn.Module):
     def __init__(
         self,
         data_size: int,
-        latent_size: int = 4,
-        context_size: int = 64,
-        hidden_size: int = 128,
+        latent_size: int = 2,
+        context_size: int = 16,
+        hidden_size: int = 16,
+        *,
+        encoder_type: str = "stochastic",
+        decoder_type: str = "deterministic",
+        diffusion_init: float = 0.3,
+        diffusion_min: float = 1e-3,
+        decoder_std_init: float = 0.05,
+        decoder_std_min: float = 1e-3,
     ) -> None:
         super().__init__()
-        self.data_size = int(data_size)
-        self.latent_size = int(latent_size)
-        self.context_size = int(context_size)
-        self.hidden_size = int(hidden_size)
-
-        self.encoder = Encoder(
-            input_size=self.data_size,
-            hidden_size=self.hidden_size,
-            output_size=self.context_size,
+        self.config = LatentSDEConfig(
+            data_size=data_size, latent_size=latent_size, context_size=context_size,
+            hidden_size=hidden_size, encoder_type=encoder_type, decoder_type=decoder_type,
+            diffusion_init=diffusion_init, diffusion_min=diffusion_min,
+            decoder_std_init=decoder_std_init, decoder_std_min=decoder_std_min,
         )
-        self.qz0_net = nn.Linear(self.context_size, self.latent_size + self.latent_size)
+        if min(data_size, latent_size, context_size, hidden_size) < 1:
+            raise ValueError("Model dimensions must be positive")
+        if encoder_type not in {"deterministic", "stochastic"}:
+            raise ValueError("encoder_type must be deterministic or stochastic")
+        if decoder_type not in {"deterministic", "stochastic"}:
+            raise ValueError("decoder_type must be deterministic or stochastic")
+        if not 0 < diffusion_min < diffusion_init:
+            raise ValueError("Require 0 < diffusion_min < diffusion_init")
+        if not 0 < decoder_std_min < decoder_std_init:
+            raise ValueError("Require 0 < decoder_std_min < decoder_std_init")
+        self.data_size, self.latent_size = int(data_size), int(latent_size)
+        self.context_size, self.hidden_size = int(context_size), int(hidden_size)
+        self.encoder_type, self.decoder_type = encoder_type, decoder_type
+        self.diffusion_min, self.decoder_std_min = diffusion_min, decoder_std_min
 
+        self.encoder = Encoder(self.data_size + 1, self.hidden_size, self.context_size)
+        initial_outputs = self.latent_size * (2 if encoder_type == "stochastic" else 1)
+        self.pz0_net = nn.Linear(self.data_size, initial_outputs)
+        self.qz0_net = nn.Linear(self.context_size, initial_outputs) if encoder_type == "stochastic" else None
+        self.h_net = nn.Linear(self.latent_size, self.latent_size)
         self.f_net = nn.Sequential(
             nn.Linear(self.latent_size + self.context_size, self.hidden_size),
-            nn.Softplus(),
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.Softplus(),
+            nn.Tanh(),
             nn.Linear(self.hidden_size, self.latent_size),
         )
-        self.h_net = nn.Sequential(
-            nn.Linear(self.latent_size, self.hidden_size),
-            nn.Softplus(),
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.Softplus(),
-            nn.Linear(self.hidden_size, self.latent_size),
-        )
-        self.g_nets = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(1, self.hidden_size),
-                    nn.Softplus(),
-                    nn.Linear(self.hidden_size, 1),
-                    nn.Sigmoid(),
-                )
-                for _ in range(self.latent_size)
-            ]
-        )
-        self.projector = nn.Linear(self.latent_size, self.data_size)
-
-        self.pz0_net = nn.Linear(self.data_size, self.latent_size + self.latent_size)
+        # Start posterior and prior drifts together, with a weak restoring prior.
+        with torch.no_grad():
+            self.h_net.weight.copy_(-0.1 * torch.eye(self.latent_size))
+            self.h_net.bias.zero_()
+            self.f_net[-1].weight.zero_()
+            self.f_net[-1].bias.zero_()
+        self.raw_diffusion = nn.Parameter(torch.full(
+            (self.latent_size,), math.log(math.expm1(diffusion_init - diffusion_min))
+        ))
+        self.projector = nn.Linear(self.latent_size, self.data_size, bias=False)
+        self.decoder_scale = None
+        if decoder_type == "stochastic":
+            self.decoder_scale = nn.Linear(self.latent_size, self.data_size)
+            nn.init.zeros_(self.decoder_scale.weight)
+            nn.init.constant_(self.decoder_scale.bias, math.log(math.expm1(decoder_std_init - decoder_std_min)))
         self._ctx: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
     @classmethod
@@ -119,118 +136,109 @@ class ConditionalLatentSDE(nn.Module):
 
     def f(self, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         if self._ctx is None:
-            raise RuntimeError("Posterior drift f requires contextualize((ts, ctx)) first.")
+            raise RuntimeError("Posterior drift requires contextualize((ts, ctx)) first")
         ts, ctx = self._ctx
-        index = torch.searchsorted(ts, t.detach(), right=True).clamp(max=ts.numel() - 1)
-        return self.f_net(torch.cat((y, ctx[int(index.item())]), dim=1))
+        index = torch.searchsorted(ts, t.detach()).clamp(max=ts.numel() - 1)
+        return self.h(t, y) + self.f_net(torch.cat((y, ctx[index]), dim=-1))
 
     def h(self, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        del t
         return self.h_net(y)
 
     def g(self, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        del t
-        y_split = torch.split(y, split_size_or_sections=1, dim=1)
-        return torch.cat([g_net_i(y_i) for g_net_i, y_i in zip(self.g_nets, y_split)], dim=1)
+        return (self.diffusion_min + nn.functional.softplus(self.raw_diffusion)).expand_as(y)
 
-    def _conditional_pz0(self, y0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.pz0_net(y0).chunk(chunks=2, dim=1)
+    @staticmethod
+    def _normal(parameters: torch.Tensor) -> Normal:
+        mean, logstd = parameters.chunk(2, dim=-1)
+        return Normal(mean, logstd.clamp(-7.0, 3.0).exp())
 
-    def _posterior_context(
-        self,
-        xs: torch.Tensor,
-        ts: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        ctx = self.encoder(torch.flip(xs, dims=(0,)))
-        ctx = torch.flip(ctx, dims=(0,))
+    def _initial(self, y0: torch.Tensor, ctx0=None) -> tuple[torch.Tensor, torch.Tensor]:
+        prior = self.pz0_net(y0)
+        if self.encoder_type == "deterministic":
+            return prior, y0.new_zeros(())
+        pz0 = self._normal(prior)
+        if ctx0 is None:
+            return pz0.rsample(), y0.new_zeros(())
+        qz0 = self._normal(self.qz0_net(ctx0))
+        return qz0.rsample(), kl_divergence(qz0, pz0).sum(-1).mean()
+
+    def _context(self, paths, ts):
+        xs = paths.transpose(0, 1)
+        time = ((ts - ts[0]) / (ts[-1] - ts[0]))[:, None, None].expand(-1, paths.size(0), 1)
+        ctx = self.encoder(torch.cat((xs, time), dim=-1).flip(0)).flip(0)
         self.contextualize((ts, ctx))
-        qz0_mean, qz0_logstd = self.qz0_net(ctx[0]).chunk(chunks=2, dim=1)
-        return ctx, qz0_mean, qz0_logstd, xs[0]
+        return ctx
+
+    def decode(self, zs: torch.Tensor, y0: torch.Tensor) -> torch.Tensor:
+        """Time-major conditional mean, anchored to the observed initial value."""
+        return y0.unsqueeze(0) + self.projector(zs - zs[:1])
+
+    def observation_distribution(self, zs, y0, noise_std=0.05):
+        mean = self.decode(zs, y0)
+        if self.decoder_scale is None:
+            if noise_std <= 0:
+                raise ValueError("noise_std must be positive")
+            scale = float(noise_std)
+        else:
+            scale = self.decoder_std_min + nn.functional.softplus(self.decoder_scale(zs))
+        return Normal(mean, scale)
+
+    def _prepare(self, paths, ts):
+        paths = _validate_paths(paths)
+        parameter = next(self.parameters())
+        paths = paths.to(parameter)
+        if paths.size(-1) != self.data_size:
+            raise ValueError(f"paths must have D={self.data_size}")
+        ts = _validate_ts(ts, expected_steps=paths.size(1)).to(parameter)
+        return paths, ts
 
     def forward(
-        self,
-        paths: torch.Tensor,
-        ts: torch.Tensor,
-        noise_std: float,
-        adjoint: bool = False,
-        method: str = "euler",
-        dt: float = 1e-2,
+        self, paths, ts, noise_std=0.05, adjoint=False, method="euler", dt=1e-2,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        paths = _validate_paths(paths)
-        ts = _validate_ts(ts, expected_steps=paths.size(1)).to(
-            device=paths.device,
-            dtype=paths.dtype,
-        )
-        xs = paths.transpose(0, 1)
-        ctx, qz0_mean, qz0_logstd, y0 = self._posterior_context(xs, ts)
-        z0 = qz0_mean + qz0_logstd.exp() * torch.randn_like(qz0_mean)
-
+        paths, ts = self._prepare(paths, ts)
+        ctx = self._context(paths, ts)
+        y0 = paths[:, 0]
+        z0, kl0 = self._initial(y0, ctx[0])
+        kwargs = dict(dt=dt, logqp=True, method=method)
         if adjoint:
-            adjoint_params = (
-                (ctx,)
-                + tuple(self.f_net.parameters())
-                + tuple(self.g_nets.parameters())
-                + tuple(self.h_net.parameters())
-            )
-            zs, log_ratio = torchsde.sdeint_adjoint(
-                self,
-                z0,
-                ts,
-                adjoint_params=adjoint_params,
-                dt=dt,
-                logqp=True,
-                method=method,
-            )
+            # Context is not a parameter: pass it explicitly to preserve GRU gradients.
+            kwargs["adjoint_params"] = (ctx, self.raw_diffusion, *self.f_net.parameters(), *self.h_net.parameters())
+        integrate = torchsde.sdeint_adjoint if adjoint else torchsde.sdeint
+        zs, log_ratio = integrate(self, z0, ts, **kwargs)
+        observations = self.observation_distribution(zs, y0, noise_std)
+        # x0 is conditioned on, not an independent likelihood term.
+        log_pxs = observations.log_prob(paths.transpose(0, 1))[1:].sum((0, 2)).mean()
+        return log_pxs, kl0 + log_ratio.sum(0).mean()
+
+    def _decode_sample(self, zs, y0, sample_observations):
+        if sample_observations is None:
+            sample_observations = self.decoder_type == "stochastic"
+        if sample_observations and self.decoder_type == "stochastic":
+            xs = self.observation_distribution(zs, y0).sample()
         else:
-            zs, log_ratio = torchsde.sdeint(
-                self,
-                z0,
-                ts,
-                dt=dt,
-                logqp=True,
-                method=method,
-            )
-
-        reconstructed = self.projector(zs)
-        xs_dist = Normal(loc=reconstructed, scale=float(noise_std))
-        log_pxs = xs_dist.log_prob(xs).sum(dim=(0, 2)).mean(dim=0)
-
-        pz0_mean, pz0_logstd = self._conditional_pz0(y0)
-        qz0 = Normal(loc=qz0_mean, scale=qz0_logstd.exp())
-        pz0 = Normal(loc=pz0_mean, scale=pz0_logstd.exp())
-        logqp0 = kl_divergence(qz0, pz0).sum(dim=1).mean(dim=0)
-        logqp_path = log_ratio.sum(dim=0).mean(dim=0)
-        return log_pxs, logqp0 + logqp_path
+            xs = self.decode(zs, y0)
+        xs[0] = y0  # The conditional initial observation is known exactly.
+        return xs.transpose(0, 1)
 
     @torch.no_grad()
-    def sample_paths(
-        self,
-        ts: torch.Tensor,
-        y0: torch.Tensor,
-        *,
-        bm=None,
-        dt: float = 1e-3,
-        method: Optional[str] = None,
-    ) -> torch.Tensor:
-        ts = _validate_ts(ts)
+    def sample_paths(self, ts, y0, *, bm=None, dt=1e-2, method="euler", sample_observations=None):
+        parameter = next(self.parameters())
+        ts = _validate_ts(ts).to(parameter)
         if y0.ndim == 1:
             y0 = y0.unsqueeze(0)
-        if y0.ndim != 2:
-            raise ValueError(f"y0 must have shape (B, D) or (D,), got {tuple(y0.shape)}")
-        if y0.size(-1) != self.data_size:
-            raise ValueError(f"y0 has D={y0.size(-1)}, expected D={self.data_size}")
+        if y0.ndim != 2 or y0.size(-1) != self.data_size or y0.size(0) == 0:
+            raise ValueError(f"y0 must have shape (B, {self.data_size})")
+        y0 = y0.to(parameter)
+        z0, _ = self._initial(y0)
+        zs = torchsde.sdeint(self, z0, ts, names={"drift": "h"}, dt=dt, method=method or "euler", bm=bm)
+        return self._decode_sample(zs, y0, sample_observations)
 
-        y0 = y0.to(device=ts.device, dtype=ts.dtype)
-        pz0_mean, pz0_logstd = self._conditional_pz0(y0)
-        eps = torch.randn_like(pz0_mean)
-        z0 = pz0_mean + pz0_logstd.exp() * eps
-        kwargs = {
-            "names": {"drift": "h"},
-            "dt": dt,
-        }
-        if method is not None:
-            kwargs["method"] = method
-        if bm is not None:
-            kwargs["bm"] = bm
-        zs = torchsde.sdeint(self, z0, ts, **kwargs)
-        return self.projector(zs).transpose(0, 1)
+    @torch.no_grad()
+    def reconstruct_paths(self, paths, ts, *, bm=None, dt=1e-2, method="euler", sample_observations=None):
+        """Posterior reconstruction, distinct from prior generation in sample_paths."""
+        paths, ts = self._prepare(paths, ts)
+        ctx = self._context(paths, ts)
+        y0 = paths[:, 0]
+        z0, _ = self._initial(y0, ctx[0])
+        zs = torchsde.sdeint(self, z0, ts, dt=dt, method=method or "euler", bm=bm)
+        return self._decode_sample(zs, y0, sample_observations)

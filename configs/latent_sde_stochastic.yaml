@@ -1,0 +1,8 @@
+defaults:
+  - latent_sde
+  - _self_
+
+run_name: latent_sde_ou_stochastic
+model:
+  encoder_type: stochastic
+  decoder_type: stochastic
